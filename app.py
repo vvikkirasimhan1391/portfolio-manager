@@ -1,0 +1,1896 @@
+"""
+Portfolio Manager - Venkat's Investment Dashboard
+Supports: Angel One (India), Vested (US), JP Morgan Workplace Solutions (UK)
+"""
+
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import json
+import os
+from pathlib import Path
+from datetime import datetime
+
+# ── Page config ────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="Portfolio Manager",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ── Paths ───────────────────────────────────────────────────────────────────────
+BASE_DIR = Path(__file__).parent
+DATA_DIR = BASE_DIR / "data"
+DATA_DIR.mkdir(exist_ok=True)
+
+SETTINGS_FILE        = DATA_DIR / "settings.json"
+US_HOLDINGS_FILE     = DATA_DIR / "us_holdings.json"
+UK_HOLDINGS_FILE     = DATA_DIR / "uk_holdings.json"
+FUNDS_FILE           = DATA_DIR / "funds.json"
+INDIA_FUNDS_FILE     = DATA_DIR / "india_funds.json"
+VESTED_HOLDINGS_FILE      = DATA_DIR / "vested_holdings.xlsx"
+VESTED_TRANSACTIONS_FILE  = DATA_DIR / "vested_transactions.xlsx"
+
+# ── Helpers ─────────────────────────────────────────────────────────────────────
+def load_json(path, default):
+    if Path(path).exists():
+        with open(path) as f:
+            return json.load(f)
+    return default
+
+def save_json(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+def fmt_inr(val):
+    """Format a number as Indian Rupees with ₹ prefix and full number with commas."""
+    if val is None:
+        return "—"
+    try:
+        val = float(val)
+        return f"₹{val:,.2f}"
+    except Exception:
+        return "—"
+
+def colour_pnl(val):
+    if val is None:
+        return "color: grey"
+    return "color: #00C875" if val >= 0 else "color: #E2445C"
+
+# ── Custom CSS ──────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+    /* Main background */
+    .stApp { background-color: #0F1117; }
+
+    /* Metric cards */
+    div[data-testid="metric-container"] {
+        background: #1E2130;
+        border: 1px solid #2E3250;
+        border-radius: 12px;
+        padding: 16px 20px;
+    }
+    div[data-testid="metric-container"] label { color: #8B92A5 !important; font-size: 13px; }
+    div[data-testid="metric-container"] div[data-testid="metric-value"] {
+        font-size: 22px !important;
+        font-weight: 700;
+        color: #E8EAF0 !important;
+    }
+
+    /* Tab styling */
+    div[data-baseweb="tab-list"] { background: #1E2130; border-radius: 10px; padding: 4px; }
+    div[data-baseweb="tab"] { color: #8B92A5 !important; }
+    div[data-baseweb="tab"][aria-selected="true"] {
+        background: #2E3A6E !important;
+        border-radius: 8px;
+        color: #FFFFFF !important;
+    }
+
+    /* Sidebar */
+    section[data-testid="stSidebar"] { background: #141722; }
+    section[data-testid="stSidebar"] .stMarkdown p { color: #8B92A5; font-size: 12px; }
+
+    /* Dataframe */
+    div[data-testid="stDataFrameContainer"] { border-radius: 10px; }
+
+    /* Success / Error */
+    .success-badge {
+        display: inline-block;
+        background: rgba(0,200,117,0.15);
+        color: #00C875;
+        border: 1px solid rgba(0,200,117,0.3);
+        border-radius: 20px;
+        padding: 2px 12px;
+        font-size: 12px;
+        font-weight: 600;
+    }
+    .error-badge {
+        display: inline-block;
+        background: rgba(226,68,92,0.15);
+        color: #E2445C;
+        border: 1px solid rgba(226,68,92,0.3);
+        border-radius: 20px;
+        padding: 2px 12px;
+        font-size: 12px;
+        font-weight: 600;
+    }
+
+    h1, h2, h3 { color: #E8EAF0 !important; }
+    p { color: #C0C4D0; }
+    .stButton>button {
+        background: #2E3A6E;
+        color: white;
+        border: none;
+        border-radius: 8px;
+    }
+    .stButton>button:hover { background: #3D4E8C; }
+</style>
+""", unsafe_allow_html=True)
+
+# ── Load modules lazily to avoid import errors ─────────────────────────────────
+@st.cache_resource
+def load_angel_module():
+    try:
+        from utils.angel_api import AngelOneClient
+        return AngelOneClient
+    except Exception as e:
+        return None
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_prices_and_fx():
+    from utils.price_fetcher import get_fx_rates, get_prices_bulk
+    return get_fx_rates(), get_prices_bulk
+
+# ── Load settings — env vars take priority over settings.json ──────────────────
+import os as _os
+
+def load_settings():
+    """
+    Merge settings from two sources (env vars win):
+      1. data/settings.json  — used locally
+      2. Environment variables — used on Railway / any cloud host
+    """
+    base = load_json(SETTINGS_FILE, {})
+    env_map = {
+        "angel_api_key":     "ANGEL_API_KEY",
+        "angel_client_id":   "ANGEL_CLIENT_ID",
+        "angel_password":    "ANGEL_PASSWORD",
+        "angel_totp_secret": "ANGEL_TOTP_SECRET",
+    }
+    for setting_key, env_key in env_map.items():
+        val = _os.environ.get(env_key, "").strip()
+        if val:
+            base[setting_key] = val
+    return base
+
+# ── Session State defaults ──────────────────────────────────────────────────────
+if "settings" not in st.session_state:
+    st.session_state.settings = load_settings()
+if "angel_holdings" not in st.session_state:
+    st.session_state.angel_holdings = None
+if "angel_error" not in st.session_state:
+    st.session_state.angel_error = None
+if "last_refresh" not in st.session_state:
+    st.session_state.last_refresh = None
+
+settings = st.session_state.settings
+
+# ── Sidebar ──────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("## 📊 Portfolio Manager")
+    st.markdown("---")
+
+    nav = st.radio(
+        "Navigate",
+        ["🏠 Dashboard", "🏦 Funds Added", "🇮🇳 India (Angel One)", "🇺🇸 US (Vested)", "🇬🇧 UK (JP Morgan)", "📋 Trade Analytics", "⚙️ Settings"],
+        label_visibility="collapsed",
+    )
+
+    st.markdown("---")
+
+    # Quick refresh button
+    if st.button("🔄 Refresh Prices", use_container_width=True):
+        st.cache_data.clear()
+        st.session_state.last_refresh = datetime.now().strftime("%H:%M:%S")
+        st.rerun()
+
+    if st.session_state.last_refresh:
+        st.markdown(f"<p>Last refresh: {st.session_state.last_refresh}</p>", unsafe_allow_html=True)
+
+    st.markdown("---")
+    st.markdown("<p>Prices refresh every 5 minutes.<br>Indian markets: NSE/BSE<br>US: NYSE/NASDAQ<br>UK: LSE</p>", unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PAGE: FUNDS ADDED
+# ══════════════════════════════════════════════════════════════════════════════
+if nav == "🏦 Funds Added":
+    st.title("🏦 Funds Added from Bank")
+
+    funds_data = load_json(FUNDS_FILE, [])
+
+    # ── India — Bank Statement Upload ──────────────────────────────────────────
+    st.markdown("### 🇮🇳 Angel One — Funds Sent from Bank")
+    st.info("Upload your bank statement (XLS) to calculate how much you have transferred to Angel One. "
+            "Any row containing **'Angel One'** in the transaction remarks is counted.")
+
+    import io as _io, subprocess as _sp, tempfile as _tmp, os as _os
+
+    bk_file = st.file_uploader("📄 Bank Statement (.xls or .xlsx)", type=["xls","xlsx"], key="bank_stmt_upload")
+
+    if bk_file:
+        with st.spinner("Parsing bank statement…"):
+            try:
+                raw_bytes = bk_file.read()
+                fname     = bk_file.name
+
+                if fname.endswith(".xls"):
+                    # Use LibreOffice to convert .xls → .csv
+                    with _tmp.NamedTemporaryFile(suffix=".xls", delete=False) as tf:
+                        tf.write(raw_bytes)
+                        tf_path = tf.name
+                    out_dir = _tmp.mkdtemp()
+                    _sp.run(
+                        ["libreoffice","--headless","--convert-to","csv", tf_path,"--outdir", out_dir],
+                        capture_output=True,
+                    )
+                    csv_path = _os.path.join(out_dir, _os.path.basename(tf_path).replace(".xls",".csv"))
+                    df_stmt  = pd.read_csv(csv_path, encoding="utf-8-sig")
+                    _os.unlink(tf_path)
+                else:
+                    df_stmt = pd.read_excel(_io.BytesIO(raw_bytes), engine="openpyxl")
+
+                df_stmt.columns = [c.strip() for c in df_stmt.columns]
+
+                # Find remarks column (flexible naming)
+                rem_col = next((c for c in df_stmt.columns
+                                if "remark" in c.lower() or "narration" in c.lower()
+                                or "description" in c.lower() or "particulars" in c.lower()), None)
+                if rem_col is None:
+                    st.error("Could not find a remarks/description column in the file.")
+                else:
+                    mask = df_stmt[rem_col].astype(str).str.contains("angel one|ipo", case=False, na=False)
+                    ao   = df_stmt[mask].copy()
+
+                    # Detect debit/credit columns
+                    debit_col  = next((c for c in ao.columns if "withdrawal" in c.lower() or "debit" in c.lower()), None)
+                    credit_col = next((c for c in ao.columns if "deposit" in c.lower()    or "credit" in c.lower()), None)
+                    date_col   = next((c for c in ao.columns if "date" in c.lower() and "transaction" not in c.lower()), None) \
+                                 or next((c for c in ao.columns if "date" in c.lower()), None)
+
+                    records = []
+                    for _, row in ao.iterrows():
+                        w = float(str(row[debit_col]).replace(",","") if debit_col else 0) if debit_col and pd.notna(row[debit_col]) else 0
+                        d = float(str(row[credit_col]).replace(",","") if credit_col else 0) if credit_col and pd.notna(row[credit_col]) else 0
+                        records.append({
+                            "date":    str(row[date_col]) if date_col else "",
+                            "remarks": str(row[rem_col]).strip(),
+                            "debit":   w,
+                            "credit":  d,
+                            "amount":  w if w > 0 else d,
+                            "type":    "DEBIT" if w > 0 else "CREDIT",
+                        })
+
+                    total_sent     = sum(r["debit"]  for r in records)
+                    total_returned = sum(r["credit"] for r in records)
+                    net_added      = total_sent - total_returned
+
+                    india_funds_data = {
+                        "source": "bank_statement",
+                        "total_sent":     round(total_sent,     2),
+                        "total_returned": round(total_returned, 2),
+                        "net_added":      round(net_added,      2),
+                        "transactions":   records,
+                    }
+                    save_json(str(INDIA_FUNDS_FILE), india_funds_data)
+                    st.success(f"✅ Found {len(records)} Angel One transactions in the statement")
+                    st.rerun()
+
+            except Exception as e:
+                st.error(f"Parse error: {e}")
+
+    # ── Show saved India funds data ────────────────────────────────────────────
+    india_funds_data = load_json(str(INDIA_FUNDS_FILE), {})
+
+    if india_funds_data:
+        total_sent     = india_funds_data.get("total_sent", 0)
+        total_returned = india_funds_data.get("total_returned", 0)
+        net_added      = india_funds_data.get("net_added", 0)
+
+        fi1, fi2, fi3 = st.columns(3)
+        fi1.metric("💸 Total Sent to Angel One", fmt_inr(total_sent),
+                   help="Sum of all outgoing bank transfers to Angel One")
+        fi2.metric("↩️ Returned from Angel One", fmt_inr(total_returned),
+                   help="Dividends / refunds credited back to your bank")
+        fi3.metric("📥 Net Funds Added",         fmt_inr(net_added))
+
+        txns = india_funds_data.get("transactions", [])
+        if txns:
+            with st.expander(f"📋 All {len(txns)} Angel One bank transactions"):
+                txn_df = pd.DataFrame(txns)
+                txn_df["debit"]  = txn_df["debit"].apply( lambda x: fmt_inr(x) if x > 0 else "—")
+                txn_df["credit"] = txn_df["credit"].apply(lambda x: fmt_inr(x) if x > 0 else "—")
+                txn_df.columns   = [c.title() for c in txn_df.columns]
+                st.dataframe(txn_df[["Date","Remarks","Debit","Credit"]],
+                             use_container_width=True, hide_index=True)
+    else:
+        st.info("Upload a bank statement above to see how much you've sent to Angel One.")
+
+    st.markdown("---")
+    st.markdown("### Manual Fund Transfers (Vested & JP Morgan)")
+    st.markdown("Vested and JP Morgan don't have fund balance APIs — log those transfers manually below.")
+
+    # ── Add a deposit ──────────────────────────────────────────────────────────
+    with st.expander("➕ Add a Fund Transfer", expanded=len(funds_data) == 0):
+        with st.form("add_fund"):
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                broker   = st.selectbox("Broker", ["Angel One (India)", "Vested (US)", "JP Morgan (UK)"])
+                amount   = st.number_input("Amount", min_value=0.01, step=100.0, format="%.2f")
+            with col2:
+                currency = st.selectbox("Currency", ["INR", "USD", "GBP"])
+                txn_date = st.date_input("Date of Transfer")
+            with col3:
+                note     = st.text_input("Note (optional)", placeholder="e.g. Monthly top-up")
+
+            if st.form_submit_button("Add Transfer", use_container_width=True):
+                funds_data.append({
+                    "broker":   broker,
+                    "amount":   amount,
+                    "currency": currency,
+                    "date":     str(txn_date),
+                    "note":     note,
+                })
+                save_json(FUNDS_FILE, funds_data)
+                st.success(f"✅ Added {currency} {amount:,.2f} to {broker}")
+                st.rerun()
+
+    if funds_data:
+        # Fetch FX to convert everything to INR
+        with st.spinner("Fetching FX rates..."):
+            from utils.price_fetcher import get_fx_rates
+            fx      = get_fx_rates()
+            usd_inr = fx.get("USD", 84.0)
+            gbp_inr = fx.get("GBP", 107.0)
+
+        def to_inr(amount, currency):
+            if currency == "INR": return amount
+            if currency == "USD": return amount * usd_inr
+            if currency == "GBP": return amount * gbp_inr
+            return amount
+
+        df_funds = pd.DataFrame(funds_data)
+        df_funds["amount"]   = pd.to_numeric(df_funds["amount"], errors="coerce")
+        df_funds["inr_value"] = df_funds.apply(lambda r: to_inr(r["amount"], r["currency"]), axis=1)
+        df_funds["date"]     = pd.to_datetime(df_funds["date"])
+
+        # ── Summary cards ──────────────────────────────────────────────────────
+        total_funds_inr  = df_funds["inr_value"].sum()
+        angel_funds_inr  = df_funds[df_funds["broker"] == "Angel One (India)"]["inr_value"].sum()
+        vested_funds_inr = df_funds[df_funds["broker"] == "Vested (US)"]["inr_value"].sum()
+        jp_funds_inr     = df_funds[df_funds["broker"] == "JP Morgan (UK)"]["inr_value"].sum()
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total Funds Added",       fmt_inr(total_funds_inr))
+        c2.metric("🇮🇳 Angel One",            fmt_inr(angel_funds_inr))
+        c3.metric("🇺🇸 Vested",               fmt_inr(vested_funds_inr))
+        c4.metric("🇬🇧 JP Morgan",            fmt_inr(jp_funds_inr))
+
+        st.markdown("---")
+
+        # ── Broker breakdown table ─────────────────────────────────────────────
+        st.markdown("### By Broker")
+        broker_summary = df_funds.groupby("broker").agg(
+            Transfers   = ("amount", "count"),
+            Total_INR   = ("inr_value", "sum"),
+        ).reset_index()
+        broker_summary.columns = ["Broker", "# Transfers", "Total (INR)"]
+        broker_summary["Total (INR)"] = broker_summary["Total (INR)"].apply(fmt_inr)
+        st.dataframe(broker_summary, use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+
+        # ── Full transaction log ───────────────────────────────────────────────
+        st.markdown("### All Transfers")
+        display_funds = df_funds.copy()
+        display_funds["Amount"] = display_funds.apply(
+            lambda r: f"{'₹' if r['currency']=='INR' else '$' if r['currency']=='USD' else '£'}{r['amount']:,.2f}", axis=1)
+        display_funds["Value (INR)"] = display_funds["inr_value"].apply(fmt_inr)
+        display_funds["Date"] = display_funds["date"].dt.strftime("%d %b %Y")
+        display_funds = display_funds[["Date", "Broker", "Amount", "Value (INR)", "note"]].rename(
+            columns={"note": "Note"})
+        display_funds = display_funds.sort_values("Date", ascending=False)
+        st.dataframe(display_funds, use_container_width=True, hide_index=True)
+
+        # ── Delete a transfer ──────────────────────────────────────────────────
+        st.markdown("### Remove a Transfer")
+        del_options = [
+            f"{r['date']} — {r['broker']} — {r['currency']} {float(r['amount']):,.2f}"
+            for r in funds_data
+        ]
+        del_choice = st.selectbox("Select transfer to remove", ["— select —"] + del_options)
+        if del_choice != "— select —":
+            if st.button("🗑️ Remove this transfer", type="secondary"):
+                idx = del_options.index(del_choice)
+                funds_data.pop(idx)
+                save_json(FUNDS_FILE, funds_data)
+                st.success("Removed.")
+                st.rerun()
+
+        # ── Cumulative chart ───────────────────────────────────────────────────
+        st.markdown("---")
+        st.markdown("### Cumulative Funds Added Over Time")
+        chart_df = df_funds.sort_values("date")[["date","inr_value"]].copy()
+        chart_df["Cumulative (INR)"] = chart_df["inr_value"].cumsum()
+        fig = px.area(
+            chart_df, x="date", y="Cumulative (INR)",
+            color_discrete_sequence=["#4A90D9"],
+        )
+        fig.update_layout(
+            paper_bgcolor="#1E2130", plot_bgcolor="#1E2130",
+            font=dict(color="#C0C4D0"),
+            xaxis=dict(showgrid=False),
+            yaxis=dict(showgrid=True, gridcolor="#2E3250"),
+            margin=dict(l=0, r=0, t=10, b=0),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    else:
+        st.info("No fund transfers recorded yet. Use the form above to log your first bank transfer.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PAGE: TRADE ANALYTICS
+# ══════════════════════════════════════════════════════════════════════════════
+elif nav == "📋 Trade Analytics":
+    st.title("📋 Trade Analytics")
+    st.markdown("Upload your Angel One reports to analyse your trades and transactions.")
+
+    # ── File uploaders split by market ────────────────────────────────────────
+    st.markdown("#### 🇮🇳 Angel One (India) Reports")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        pnl_file   = st.file_uploader("📄 P&L Statement",      type=["xlsx"], key="pnl_upload")
+    with col2:
+        trade_file = st.file_uploader("📄 Trade History",       type=["xlsx"], key="trade_upload")
+    with col3:
+        stmt_file  = st.file_uploader("📄 Account Statement",   type=["xlsx"], key="stmt_upload")
+
+    st.markdown("#### 🇺🇸 Vested (US) Reports")
+    col4, col5 = st.columns(2)
+    with col4:
+        vested_txn_file = st.file_uploader("📄 Vested Transactions", type=["xlsx"], key="vested_txn_upload")
+    with col5:
+        vested_pnl_file = st.file_uploader("📄 Vested P&L Statement",type=["xlsx"], key="vested_pnl_upload")
+
+    if pnl_file and trade_file:
+        st.session_state.ta_pnl_bytes   = pnl_file.read()
+        st.session_state.ta_trade_bytes = trade_file.read()
+    if stmt_file:
+        st.session_state.ta_stmt_bytes  = stmt_file.read()
+    if vested_txn_file:
+        st.session_state.vested_txn_bytes = vested_txn_file.read()
+    if vested_pnl_file:
+        st.session_state.vested_pnl_bytes = vested_pnl_file.read()
+
+    has_data        = "ta_pnl_bytes" in st.session_state and "ta_trade_bytes" in st.session_state
+    has_vested_data = "vested_txn_bytes" in st.session_state or "vested_pnl_bytes" in st.session_state
+
+    if not has_data and not has_vested_data:
+        st.info("Upload your Angel One reports above to see analytics.\n\n"
+                "You can also upload Vested reports independently for US portfolio analysis.")
+        st.stop()
+
+    # ── Parse files ────────────────────────────────────────────────────────────
+    import io
+    @st.cache_data(show_spinner=False)
+    def parse_trade_data(pnl_bytes, trade_bytes):
+        pnl_raw    = pd.read_excel(io.BytesIO(pnl_bytes),   sheet_name="Equity P&L", header=None)
+        trades_raw = pd.read_excel(io.BytesIO(trade_bytes), header=None)
+
+        # ── Summary figures ────────────────────────────────────────────────────
+        summary = {}
+        for _, row in pnl_raw.iterrows():
+            key = str(row[0]).strip() if pd.notna(row[0]) else ""
+            val = row[1] if pd.notna(row[1]) else None
+            for k in ["Total Gross PnL","Net PnL","Intraday Net PnL",
+                      "Short Term Net PnL","Total Brokerage","Total STT","Total GST"]:
+                if key == k and val is not None:
+                    summary[k] = float(val)
+
+        # ── PnL tables ─────────────────────────────────────────────────────────
+        def parse_pnl_section(raw, data_start, data_end, trade_type):
+            rows = raw.iloc[data_start:data_end].copy()
+            df   = rows.iloc[:, :8].copy()
+            df.columns = ["Symbol","Company","Quantity","AvgBuyPrice",
+                          "BuyValue","AvgSellPrice","SellValue","GrossPnL"]
+            df = df[~df["Symbol"].astype(str).str.strip().isin(["Total","nan"])].dropna(subset=["Symbol"])
+            for c in ["Quantity","AvgBuyPrice","BuyValue","AvgSellPrice","SellValue","GrossPnL"]:
+                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+            df["TradeType"] = trade_type
+            return df
+
+        delivery_df = parse_pnl_section(pnl_raw, 32, 68, "Delivery")
+        intraday_df = parse_pnl_section(pnl_raw, 72, 86, "Intraday")
+        all_pnl     = pd.concat([delivery_df, intraday_df], ignore_index=True)
+
+        # ── Trade history ──────────────────────────────────────────────────────
+        trades_df = trades_raw.iloc[35:].copy()
+        col_names = ["Company","BuySell","BuyPrice","SellPrice","Quantity",
+                     "Brokerage","GST","STT","SebiTax","ExchangeCharges",
+                     "StampDuty","OtherCharges","IPFTCharges","OrderType",
+                     "Segment","Exchange","OrderID","TradeID","Date"]
+        trades_df.columns = col_names[:len(trades_df.columns)]
+        trades_df = trades_df.dropna(subset=["Company"])
+        trades_df = trades_df[trades_df["Company"].astype(str).str.strip().ne("")]
+        for c in ["BuyPrice","SellPrice","Quantity","Brokerage","GST","STT"]:
+            trades_df[c] = pd.to_numeric(trades_df[c], errors="coerce").fillna(0)
+        trades_df["Date"] = pd.to_datetime(trades_df["Date"], errors="coerce")
+
+        buy_df  = trades_df[trades_df["BuySell"] == "Buy"]
+        sell_df = trades_df[trades_df["BuySell"] == "Sell"]
+
+        # Per-company stats
+        buy_stats   = buy_df.groupby("Company").apply(
+            lambda g: pd.Series({"BuyTrades": len(g), "BuyValue": (g["BuyPrice"]*g["Quantity"]).sum()})
+        ).reset_index()
+        sell_stats  = sell_df.groupby("Company").apply(
+            lambda g: pd.Series({"SellTrades": len(g), "SellValue": (g["SellPrice"]*g["Quantity"]).sum()})
+        ).reset_index()
+        charge_stats = trades_df.groupby("Company").agg(
+            Charges=("Brokerage","sum")
+        ).reset_index()
+
+        company_stats = buy_stats.merge(sell_stats,   on="Company", how="outer").fillna(0)
+        company_stats = company_stats.merge(charge_stats, on="Company", how="left").fillna(0)
+        company_stats["BuyTrades"]  = company_stats["BuyTrades"].astype(int)
+        company_stats["SellTrades"] = company_stats["SellTrades"].astype(int)
+
+        pnl_by_company = all_pnl.groupby("Company").agg(
+            GrossPnL=("GrossPnL","sum"),
+        ).reset_index()
+        final = company_stats.merge(pnl_by_company, on="Company", how="left")
+        final["GrossPnL"] = final["GrossPnL"].fillna(0)
+        final["NetPnL"]   = final["GrossPnL"] - final["Charges"]
+        final = final.sort_values("BuyValue", ascending=False).reset_index(drop=True)
+
+        # Totals
+        total_invested  = (buy_df["BuyPrice"]  * buy_df["Quantity"]).sum()
+        total_recovered = (sell_df["SellPrice"] * sell_df["Quantity"]).sum()
+        total_charges   = trades_df["Brokerage"].sum() + trades_df["GST"].sum() + trades_df["STT"].sum()
+        gross_pnl       = summary.get("Total Gross PnL", 0)
+        net_pnl         = summary.get("Net PnL",         0)
+
+        totals = {
+            "total_invested":  total_invested,
+            "total_recovered": total_recovered,
+            "total_charges":   total_charges,
+            "gross_pnl":       gross_pnl,
+            "net_pnl":         net_pnl,
+            "intraday_pnl":    summary.get("Intraday Net PnL",   0),
+            "delivery_pnl":    summary.get("Short Term Net PnL", 0),
+            "total_trades":    len(trades_df),
+            "buy_trades":      len(buy_df),
+            "sell_trades":     len(sell_df),
+        }
+        return final, totals, trades_df
+
+    if has_data:
+        with st.spinner("Parsing your files…"):
+            company_df, totals, trades_df = parse_trade_data(
+                st.session_state.ta_pnl_bytes,
+                st.session_state.ta_trade_bytes
+            )
+
+        # ── Summary metrics ────────────────────────────────────────────────────────
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("💰 Total Funds Invested",   fmt_inr(totals["total_invested"]))
+        c2.metric("💵 Total Recovered (Sells)",fmt_inr(totals["total_recovered"]))
+        c3.metric("📊 Gross P&L",             fmt_inr(totals["gross_pnl"]),
+                  f"{totals['gross_pnl']/totals['total_invested']*100:+.2f}%" if totals["total_invested"] else "",
+                  delta_color="normal" if totals["gross_pnl"] >= 0 else "inverse")
+        c4.metric("🏦 Net P&L (after charges)",fmt_inr(totals["net_pnl"]),
+                  delta_color="normal" if totals["net_pnl"] >= 0 else "inverse")
+
+        st.markdown("---")
+
+        c5, c6, c7, c8 = st.columns(4)
+        c5.metric("Delivery P&L",  fmt_inr(totals["delivery_pnl"]),
+                  delta_color="normal" if totals["delivery_pnl"] >= 0 else "inverse")
+        c6.metric("Intraday P&L",  fmt_inr(totals["intraday_pnl"]),
+                  delta_color="normal" if totals["intraday_pnl"] >= 0 else "inverse")
+        c7.metric("Total Trades",  f"{totals['total_trades']}",
+                  f"{totals['buy_trades']} buy · {totals['sell_trades']} sell")
+        c8.metric("Total Charges", fmt_inr(totals["total_charges"]))
+
+        st.markdown("---")
+
+        # ── Top Gainers / Losers ────────────────────────────────────────────────────
+        st.markdown("### Top Gainers & Losers")
+        g_col, l_col = st.columns(2)
+
+        with g_col:
+            gainers = company_df[company_df["GrossPnL"] > 0].nlargest(8, "GrossPnL")
+            if not gainers.empty:
+                fig_g = go.Figure(go.Bar(
+                    x=gainers["GrossPnL"], y=gainers["Company"],
+                    orientation="h", marker_color="#22c55e",
+                    text=gainers["GrossPnL"].apply(lambda x: f"₹{x:+,.0f}"),
+                    textposition="outside",
+                ))
+                fig_g.update_layout(
+                    title="🟢 Top Gainers", paper_bgcolor="#1E2130", plot_bgcolor="#1E2130",
+                    font=dict(color="#C0C4D0"), margin=dict(l=10,r=60,t=40,b=10),
+                    height=320, xaxis=dict(showgrid=False), yaxis=dict(showgrid=False),
+                )
+                st.plotly_chart(fig_g, use_container_width=True)
+
+        with l_col:
+            losers = company_df[company_df["GrossPnL"] < 0].nsmallest(8, "GrossPnL")
+            if not losers.empty:
+                fig_l = go.Figure(go.Bar(
+                    x=losers["GrossPnL"], y=losers["Company"],
+                    orientation="h", marker_color="#ef4444",
+                    text=losers["GrossPnL"].apply(lambda x: f"₹{x:+,.0f}"),
+                    textposition="outside",
+                ))
+                fig_l.update_layout(
+                    title="🔴 Top Losers", paper_bgcolor="#1E2130", plot_bgcolor="#1E2130",
+                    font=dict(color="#C0C4D0"), margin=dict(l=10,r=60,t=40,b=10),
+                    height=320, xaxis=dict(showgrid=False), yaxis=dict(showgrid=False),
+                )
+                st.plotly_chart(fig_l, use_container_width=True)
+
+        st.markdown("---")
+
+        # ── Company-wise table ──────────────────────────────────────────────────────
+        st.markdown("### Company-wise Breakdown")
+        search = st.text_input("🔍 Search company", placeholder="e.g. TATA, INFY…", label_visibility="collapsed")
+
+        display_df = company_df.copy()
+        if search:
+            display_df = display_df[display_df["Company"].str.upper().str.contains(search.upper())]
+
+        display_df["Funds Invested"] = display_df["BuyValue"].apply(fmt_inr)
+        display_df["Gross P&L"]      = display_df["GrossPnL"].apply(lambda x: f"₹{x:+,.2f}")
+        display_df["Charges"]        = display_df["Charges"].apply(lambda x: f"₹{x:,.2f}")
+        display_df["Net P&L"]        = display_df["NetPnL"].apply(lambda x: f"₹{x:+,.2f}")
+
+        st.dataframe(
+            display_df[["Company","BuyTrades","SellTrades","Funds Invested","Gross P&L","Charges","Net P&L"]].rename(
+                columns={"BuyTrades":"Buy Trades","SellTrades":"Sell Trades"}
+            ),
+            use_container_width=True, hide_index=True
+        )
+
+        st.markdown("---")
+
+        # ── Monthly P&L trend ───────────────────────────────────────────────────────
+        st.markdown("### Monthly Trade Activity")
+        if "Date" in trades_df.columns and trades_df["Date"].notna().any():
+            trades_df["Month"] = trades_df["Date"].dt.to_period("M").astype(str)
+            buy_monthly  = trades_df[trades_df["BuySell"]=="Buy"].groupby("Month").apply(
+                lambda g: (g["BuyPrice"]*g["Quantity"]).sum()).reset_index(name="BuyValue")
+            sell_monthly = trades_df[trades_df["BuySell"]=="Sell"].groupby("Month").apply(
+                lambda g: (g["SellPrice"]*g["Quantity"]).sum()).reset_index(name="SellValue")
+            monthly = buy_monthly.merge(sell_monthly, on="Month", how="outer").fillna(0).sort_values("Month")
+
+            fig_m = go.Figure()
+            fig_m.add_trace(go.Bar(name="Buy Value",  x=monthly["Month"], y=monthly["BuyValue"],
+                                   marker_color="#3b82f6"))
+            fig_m.add_trace(go.Bar(name="Sell Value", x=monthly["Month"], y=monthly["SellValue"],
+                                   marker_color="#22c55e"))
+            fig_m.update_layout(
+                barmode="group", paper_bgcolor="#1E2130", plot_bgcolor="#1E2130",
+                font=dict(color="#C0C4D0"), legend=dict(bgcolor="#1E2130"),
+                margin=dict(l=0,r=0,t=20,b=0),
+                xaxis=dict(showgrid=False), yaxis=dict(showgrid=True, gridcolor="#2E3250"),
+                height=300,
+            )
+            st.plotly_chart(fig_m, use_container_width=True)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  ACCOUNT STATEMENT SECTION
+    # ══════════════════════════════════════════════════════════════════════════
+    st.markdown("---")
+    st.markdown("## 📒 Account Statement — Transaction Analysis")
+
+    if "ta_stmt_bytes" not in st.session_state:
+        st.info("Upload your **Account Statement (.xlsx)** above to see transaction-wise analysis.")
+    else:
+        import io as _io
+
+        @st.cache_data(show_spinner=False)
+        def parse_statement(stmt_bytes):
+            raw = pd.read_excel(_io.BytesIO(stmt_bytes), sheet_name="Broking Ledger", header=None)
+
+            # Summary figures from header rows
+            opening  = 0.0
+            closing  = 0.0
+            t_credit = 0.0
+            t_debit  = 0.0
+            for _, row in raw.iterrows():
+                r = [str(v).strip() if pd.notna(v) else "" for v in row]
+                if r[0] == "Opening Balance":
+                    try: opening = float(r[1])
+                    except: pass
+                if "Closing Balance" in r:
+                    idx = r.index("Closing Balance")
+                    try: closing = float(r[idx+1])
+                    except: pass
+                if r[0] == "Total Credit":
+                    try: t_credit = float(r[1])
+                    except: pass
+                if r[0] == "Total Debit":
+                    try: t_debit = float(r[1])
+                    except: pass
+
+            # Transaction rows start after the header row "Transaction Date Segment..."
+            header_idx = None
+            for i, row in raw.iterrows():
+                if str(row[0]).strip() == "Transaction":
+                    header_idx = i
+                    break
+
+            txn_df = raw.iloc[header_idx+1:].copy()
+            txn_df.columns = ["Transaction","Date","Segment","Voucher","Debit","Credit","Balance"]
+            txn_df = txn_df.dropna(subset=["Transaction"])
+            txn_df = txn_df[txn_df["Transaction"].astype(str).str.strip().ne("")]
+            txn_df["Transaction"] = txn_df["Transaction"].astype(str).str.strip()
+            for c in ["Debit","Credit","Balance"]:
+                txn_df[c] = pd.to_numeric(txn_df[c], errors="coerce").fillna(0)
+            txn_df["Date"] = pd.to_datetime(txn_df["Date"], errors="coerce")
+            txn_df = txn_df[txn_df["Date"].notna()].copy()
+            txn_df["Month"] = txn_df["Date"].dt.to_period("M").astype(str)
+
+            # Charges sheet
+            charges_raw = pd.read_excel(_io.BytesIO(stmt_bytes), sheet_name="Charges", header=None)
+            charges_summary = {}
+            for _, row in charges_raw.iterrows():
+                key = str(row[0]).strip() if pd.notna(row[0]) else ""
+                val = row[1] if pd.notna(row[1]) else 0
+                for k in ["Total DP Charges","Total Pledge/Unpledge Charges",
+                           "Total CUSPA Sell-off Charges","Total Interest Charges"]:
+                    if key == k:
+                        try: charges_summary[k] = float(val)
+                        except: pass
+
+            return txn_df, {"opening": opening, "closing": closing,
+                            "total_credit": t_credit, "total_debit": t_debit}, charges_summary
+
+        with st.spinner("Parsing statement…"):
+            txn_df, ledger_summary, charges_summary = parse_statement(st.session_state.ta_stmt_bytes)
+
+        # ── Ledger summary cards ───────────────────────────────────────────────
+        funds_added_total = txn_df[txn_df["Transaction"] == "Funds Added"]["Credit"].sum()
+        trades_debit      = txn_df[txn_df["Transaction"] == "Trades Executed"]["Debit"].sum()
+        trades_credit     = txn_df[txn_df["Transaction"] == "Trades Executed"]["Credit"].sum()
+        total_charges_stmt = (txn_df[~txn_df["Transaction"].isin(["Funds Added","Trades Executed",
+                              "Quarterly Settlement","REVERSED DEMAT ACCOUNT MONTHLY MAINTENANACE CHARGES DT : JAN 1 2026",
+                              "Msg"])]["Debit"].sum())
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("🏦 Funds Added from Bank",  fmt_inr(funds_added_total))
+        c2.metric("📤 Total Trade Spend",       fmt_inr(trades_debit))
+        c3.metric("📥 Total Trade Receipts",    fmt_inr(trades_credit))
+        c4.metric("💸 Closing Balance",         fmt_inr(ledger_summary["closing"]))
+
+        st.markdown("---")
+
+        # ── Transaction type summary table ────────────────────────────────────
+        st.markdown("### By Transaction Type")
+        grp = txn_df.groupby("Transaction").agg(
+            Count   = ("Date",   "count"),
+            Debit   = ("Debit",  "sum"),
+            Credit  = ("Credit", "sum"),
+        ).reset_index().sort_values("Debit", ascending=False)
+        grp["Net (Credit − Debit)"] = grp["Credit"] - grp["Debit"]
+        disp_grp = grp.copy()
+        for col in ["Debit","Credit","Net (Credit − Debit)"]:
+            disp_grp[col] = disp_grp[col].apply(fmt_inr)
+        disp_grp.columns = ["Transaction Type","# Entries","Total Debit","Total Credit","Net"]
+        st.dataframe(disp_grp, use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+
+        # ── Two charts side by side ────────────────────────────────────────────
+        ch1, ch2 = st.columns(2)
+
+        with ch1:
+            st.markdown("### Monthly Funds Added")
+            monthly_funds = (
+                txn_df[txn_df["Transaction"] == "Funds Added"]
+                .groupby("Month")["Credit"].sum()
+                .reset_index()
+                .sort_values("Month")
+            )
+            if not monthly_funds.empty:
+                fig_fa = px.bar(monthly_funds, x="Month", y="Credit",
+                                color_discrete_sequence=["#4A90D9"],
+                                labels={"Credit":"Amount (INR)","Month":"Month"})
+                fig_fa.update_layout(
+                    paper_bgcolor="#1E2130", plot_bgcolor="#1E2130",
+                    font=dict(color="#C0C4D0"),
+                    xaxis=dict(showgrid=False, tickangle=-45),
+                    yaxis=dict(showgrid=True, gridcolor="#2E3250"),
+                    margin=dict(l=0,r=0,t=10,b=0), height=280,
+                )
+                st.plotly_chart(fig_fa, use_container_width=True)
+
+        with ch2:
+            st.markdown("### Monthly Trade Activity (Debit vs Credit)")
+            monthly_trades = (
+                txn_df[txn_df["Transaction"] == "Trades Executed"]
+                .groupby("Month")[["Debit","Credit"]].sum()
+                .reset_index().sort_values("Month")
+            )
+            if not monthly_trades.empty:
+                fig_tr = go.Figure()
+                fig_tr.add_trace(go.Bar(name="Trade Spend",    x=monthly_trades["Month"],
+                                        y=monthly_trades["Debit"],  marker_color="#ef4444"))
+                fig_tr.add_trace(go.Bar(name="Trade Receipts", x=monthly_trades["Month"],
+                                        y=monthly_trades["Credit"], marker_color="#22c55e"))
+                fig_tr.update_layout(
+                    barmode="group", paper_bgcolor="#1E2130", plot_bgcolor="#1E2130",
+                    font=dict(color="#C0C4D0"), legend=dict(bgcolor="#1E2130"),
+                    xaxis=dict(showgrid=False, tickangle=-45),
+                    yaxis=dict(showgrid=True, gridcolor="#2E3250"),
+                    margin=dict(l=0,r=0,t=10,b=0), height=280,
+                )
+                st.plotly_chart(fig_tr, use_container_width=True)
+
+        st.markdown("---")
+
+        # ── Running balance chart ──────────────────────────────────────────────
+        st.markdown("### Account Balance Over Time")
+        bal_df = txn_df[txn_df["Balance"] != 0].sort_values("Date")
+        if not bal_df.empty:
+            fig_bal = px.area(bal_df, x="Date", y="Balance",
+                              color_discrete_sequence=["#4A90D9"],
+                              labels={"Balance":"Running Balance (INR)"})
+            fig_bal.add_hline(y=0, line_color="#6b7280", line_dash="dash")
+            fig_bal.update_layout(
+                paper_bgcolor="#1E2130", plot_bgcolor="#1E2130",
+                font=dict(color="#C0C4D0"),
+                xaxis=dict(showgrid=False),
+                yaxis=dict(showgrid=True, gridcolor="#2E3250"),
+                margin=dict(l=0,r=0,t=10,b=0), height=280,
+            )
+            st.plotly_chart(fig_bal, use_container_width=True)
+
+        st.markdown("---")
+
+        # ── Charges breakdown ──────────────────────────────────────────────────
+        st.markdown("### Charges Breakdown")
+        cc1, cc2, cc3, cc4 = st.columns(4)
+        cc1.metric("DP Charges",              fmt_inr(charges_summary.get("Total DP Charges", 0)))
+        cc2.metric("Pledge/Unpledge",         fmt_inr(charges_summary.get("Total Pledge/Unpledge Charges", 0)))
+        cc3.metric("Interest Charges",        fmt_inr(charges_summary.get("Total Interest Charges", 0)))
+        cc4.metric("CUSPA Sell-off",          fmt_inr(charges_summary.get("Total CUSPA Sell-off Charges", 0)))
+
+        # DP charges detail table
+        dp_rows = txn_df[txn_df["Transaction"] == "DP Charges"][["Date","Debit","Segment"]].copy()
+        if not dp_rows.empty:
+            with st.expander(f"📋 DP Charges detail ({len(dp_rows)} entries)"):
+                dp_rows["Date"]  = dp_rows["Date"].dt.strftime("%d %b %Y")
+                dp_rows["Debit"] = dp_rows["Debit"].apply(fmt_inr)
+                dp_rows.columns  = ["Date","Amount","Segment"]
+                st.dataframe(dp_rows, use_container_width=True, hide_index=True)
+
+        # ── Full transaction log ───────────────────────────────────────────────
+        st.markdown("---")
+        st.markdown("### Full Transaction Log")
+        txn_filter = st.multiselect(
+            "Filter by transaction type",
+            options=sorted(txn_df["Transaction"].unique()),
+            default=sorted(txn_df["Transaction"].unique()),
+        )
+        filtered_txn = txn_df[txn_df["Transaction"].isin(txn_filter)].copy()
+        filtered_txn["Date"]    = filtered_txn["Date"].dt.strftime("%d %b %Y")
+        filtered_txn["Debit"]   = filtered_txn["Debit"].apply(fmt_inr)
+        filtered_txn["Credit"]  = filtered_txn["Credit"].apply(fmt_inr)
+        filtered_txn["Balance"] = filtered_txn["Balance"].apply(
+            lambda x: f"₹{float(x):+,.2f}" if x != 0 else "—")
+        st.dataframe(
+            filtered_txn[["Date","Transaction","Debit","Credit","Balance","Segment","Voucher"]],
+            use_container_width=True, hide_index=True
+        )
+
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  VESTED (US) SECTION
+    # ══════════════════════════════════════════════════════════════════════════
+    if has_vested_data:
+        st.markdown("---")
+        st.markdown("## 🇺🇸 Vested (US) Portfolio Analytics")
+
+        import io as _io
+
+        @st.cache_data(show_spinner=False)
+        def parse_vested_data(txn_bytes, pnl_bytes):
+            result = {
+                "transfers": pd.DataFrame(),
+                "trades": pd.DataFrame(),
+                "income": pd.DataFrame(),
+                "unrealized": pd.DataFrame(),
+                "realized": pd.DataFrame(),
+                "errors": [],
+            }
+
+            # ── Transactions file ──────────────────────────────────────────────
+            if txn_bytes:
+                try:
+                    xl = pd.ExcelFile(_io.BytesIO(txn_bytes))
+
+                    # Transfers sheet
+                    if "Transfers" in xl.sheet_names:
+                        df = xl.parse("Transfers")
+                        df.columns = [c.strip() for c in df.columns]
+                        amt_col = [c for c in df.columns if "Cash Amount" in c]
+                        if amt_col:
+                            df["amount_usd"] = pd.to_numeric(df[amt_col[0]], errors="coerce").fillna(0)
+                        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+                        result["transfers"] = df
+
+                    # Trades sheet
+                    if "Trades" in xl.sheet_names:
+                        df = xl.parse("Trades")
+                        df.columns = [c.strip() for c in df.columns]
+                        for col in ["Cash Amount (in USD)", "Price Per Share (in USD)",
+                                    "Commission Charges (in USD)", "Quantity"]:
+                            if col in df.columns:
+                                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+                        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+                        result["trades"] = df
+
+                    # Income sheet
+                    if "Income" in xl.sheet_names:
+                        df = xl.parse("Income")
+                        df.columns = [c.strip() for c in df.columns]
+                        amt_col = [c for c in df.columns if "Gross Cash" in c or "Amount" in c]
+                        if amt_col:
+                            df["amount_usd"] = pd.to_numeric(df[amt_col[0]], errors="coerce").fillna(0)
+                        result["income"] = df
+
+                except Exception as e:
+                    result["errors"].append(f"Transactions parse error: {e}")
+
+            # ── P&L file ───────────────────────────────────────────────────────
+            if pnl_bytes:
+                try:
+                    xl = pd.ExcelFile(_io.BytesIO(pnl_bytes))
+
+                    unreal_sheet = next((s for s in xl.sheet_names if "Unrealized" in s and "Summary" in s), None)
+                    real_sheet   = next((s for s in xl.sheet_names if "Realized" in s and "Summary" in s), None)
+
+                    if unreal_sheet:
+                        df = xl.parse(unreal_sheet)
+                        df.columns = [c.strip() for c in df.columns]
+                        for col in df.columns:
+                            if col != "Security":
+                                df[col] = pd.to_numeric(df[col], errors="coerce")
+                        result["unrealized"] = df
+
+                    if real_sheet:
+                        df = xl.parse(real_sheet)
+                        df.columns = [c.strip() for c in df.columns]
+                        for col in df.columns:
+                            if col != "Security":
+                                df[col] = pd.to_numeric(df[col], errors="coerce")
+                        result["realized"] = df
+
+                except Exception as e:
+                    result["errors"].append(f"P&L parse error: {e}")
+
+            return result
+
+        vdata = parse_vested_data(
+            st.session_state.get("vested_txn_bytes"),
+            st.session_state.get("vested_pnl_bytes"),
+        )
+
+        for err in vdata["errors"]:
+            st.warning(f"⚠️ {err}")
+
+        fx = st.session_state.get("fx_rates", {"USD": 84.0, "INR": 1.0})
+        usd_to_inr = fx.get("USD", 84.0)
+
+        # ── Summary metrics ────────────────────────────────────────────────────
+        total_deposited = vdata["transfers"]["amount_usd"].sum() if not vdata["transfers"].empty else 0.0
+
+        realized_pnl = 0.0
+        if not vdata["realized"].empty:
+            pnl_col = [c for c in vdata["realized"].columns if "Profit/Loss (USD)" in c]
+            if pnl_col:
+                realized_pnl = float(vdata["realized"][pnl_col[0]].sum())
+
+        unrealized_pnl = 0.0
+        market_value   = 0.0
+        cost_basis_open = 0.0
+        if not vdata["unrealized"].empty:
+            pnl_col = [c for c in vdata["unrealized"].columns if "Profit/Loss (USD)" in c]
+            mv_col  = [c for c in vdata["unrealized"].columns if "Market Value" in c]
+            cb_col  = [c for c in vdata["unrealized"].columns if "Cost Basis" in c]
+            if pnl_col:
+                unrealized_pnl = float(vdata["unrealized"][pnl_col[0]].sum())
+            if mv_col:
+                market_value = float(vdata["unrealized"][mv_col[0]].sum())
+            if cb_col:
+                cost_basis_open = float(vdata["unrealized"][cb_col[0]].sum())
+
+        dividend_income = vdata["income"]["amount_usd"].sum() if not vdata["income"].empty else 0.0
+        net_pnl = realized_pnl + unrealized_pnl + dividend_income
+
+        def fmt_usd(v):
+            sign = "+" if v > 0 else ""
+            return f"{sign}${v:,.2f}"
+
+        def fmt_usd_plain(v):
+            return f"${v:,.2f}"
+
+        vm1, vm2, vm3, vm4, vm5 = st.columns(5)
+        vm1.metric("💵 Total Deposited",    fmt_usd_plain(total_deposited),
+                   f"≈ {fmt_inr(total_deposited * usd_to_inr)}")
+        vm2.metric("📈 Unrealized P&L",     fmt_usd(unrealized_pnl),
+                   f"≈ {fmt_inr(unrealized_pnl * usd_to_inr)}",
+                   delta_color="normal")
+        vm3.metric("✅ Realized P&L",       fmt_usd(realized_pnl),
+                   f"≈ {fmt_inr(realized_pnl * usd_to_inr)}",
+                   delta_color="normal")
+        vm4.metric("💰 Dividend Income",    fmt_usd_plain(dividend_income),
+                   f"≈ {fmt_inr(dividend_income * usd_to_inr)}")
+        vm5.metric("🏆 Net P&L",            fmt_usd(net_pnl),
+                   f"≈ {fmt_inr(net_pnl * usd_to_inr)}",
+                   delta_color="normal")
+
+        st.markdown("---")
+
+        # ── Open Positions ─────────────────────────────────────────────────────
+        if not vdata["unrealized"].empty:
+            st.markdown("### 📂 Open Positions")
+            udf = vdata["unrealized"].copy()
+            pnl_col = [c for c in udf.columns if "Profit/Loss (USD)" in c and "%" not in c]
+            pct_col = [c for c in udf.columns if "Profit/Loss (%)" in c]
+            mv_col  = [c for c in udf.columns if "Market Value" in c]
+            cb_col  = [c for c in udf.columns if "Cost Basis" in c]
+
+            display_cols = ["Security", "Quantity"]
+            rename_map = {"Security": "Ticker"}
+            if cb_col:
+                udf["Cost (USD)"]   = udf[cb_col[0]].map(lambda x: f"${x:,.2f}")
+                display_cols.append("Cost (USD)")
+            if mv_col:
+                udf["Value (USD)"]  = udf[mv_col[0]].map(lambda x: f"${x:,.2f}")
+                display_cols.append("Value (USD)")
+            if pnl_col:
+                udf["P&L (USD)"]    = udf[pnl_col[0]].map(lambda x: f"+${x:,.2f}" if x >= 0 else f"-${abs(x):,.2f}")
+                display_cols.append("P&L (USD)")
+            if pct_col:
+                udf["P&L (%)"]      = udf[pct_col[0]].map(lambda x: f"+{x:.2f}%" if x >= 0 else f"{x:.2f}%")
+                display_cols.append("P&L (%)")
+            if mv_col:
+                udf["Value (INR)"]  = udf[mv_col[0]].map(lambda x: fmt_inr(x * usd_to_inr))
+                display_cols.append("Value (INR)")
+
+            st.dataframe(udf[display_cols].rename(columns=rename_map),
+                         use_container_width=True, hide_index=True)
+
+            # Unrealized P&L bar chart
+            if pnl_col:
+                fig_u = px.bar(
+                    udf.sort_values(pnl_col[0], ascending=False),
+                    x="Security", y=pnl_col[0],
+                    color=pnl_col[0],
+                    color_continuous_scale=["#EF4444","#F97316","#22C55E"],
+                    labels={pnl_col[0]: "Unrealized P&L (USD)", "Security": "Ticker"},
+                    title="Unrealized P&L per Stock (USD)",
+                )
+                fig_u.update_layout(
+                    paper_bgcolor="#1E2130", plot_bgcolor="#1E2130",
+                    font=dict(color="#C0C4D0"),
+                    xaxis=dict(showgrid=False),
+                    yaxis=dict(showgrid=True, gridcolor="#2E3250"),
+                    coloraxis_showscale=False,
+                    margin=dict(l=0,r=0,t=40,b=0), height=300,
+                )
+                st.plotly_chart(fig_u, use_container_width=True)
+
+        # ── Realized P&L ───────────────────────────────────────────────────────
+        if not vdata["realized"].empty:
+            st.markdown("---")
+            st.markdown("### 📊 Realized P&L — Closed Positions")
+            rdf = vdata["realized"].copy()
+            pnl_col = [c for c in rdf.columns if "Profit/Loss (USD)" in c and "%" not in c]
+            pct_col = [c for c in rdf.columns if "Profit/Loss (%)" in c]
+            proc_col = [c for c in rdf.columns if "Proceeds" in c]
+            cb_col   = [c for c in rdf.columns if "Cost Basis" in c]
+
+            if pnl_col:
+                rdf_sorted = rdf.sort_values(pnl_col[0], ascending=False)
+
+                # Top gainers / losers side-by-side
+                top_n  = min(10, len(rdf_sorted))
+                gainers = rdf_sorted.head(top_n)
+                losers  = rdf_sorted.tail(top_n).sort_values(pnl_col[0])
+
+                gc, lc = st.columns(2)
+                with gc:
+                    st.markdown("**🏆 Top Gainers**")
+                    fig_g = px.bar(gainers, x="Security", y=pnl_col[0],
+                                   color_discrete_sequence=["#22C55E"],
+                                   labels={pnl_col[0]: "P&L (USD)"})
+                    fig_g.update_layout(
+                        paper_bgcolor="#1E2130", plot_bgcolor="#1E2130",
+                        font=dict(color="#C0C4D0"),
+                        xaxis=dict(showgrid=False),
+                        yaxis=dict(showgrid=True, gridcolor="#2E3250"),
+                        margin=dict(l=0,r=0,t=10,b=0), height=260,
+                    )
+                    st.plotly_chart(fig_g, use_container_width=True)
+
+                with lc:
+                    st.markdown("**📉 Top Losers**")
+                    fig_l = px.bar(losers, x="Security", y=pnl_col[0],
+                                   color_discrete_sequence=["#EF4444"],
+                                   labels={pnl_col[0]: "P&L (USD)"})
+                    fig_l.update_layout(
+                        paper_bgcolor="#1E2130", plot_bgcolor="#1E2130",
+                        font=dict(color="#C0C4D0"),
+                        xaxis=dict(showgrid=False),
+                        yaxis=dict(showgrid=True, gridcolor="#2E3250"),
+                        margin=dict(l=0,r=0,t=10,b=0), height=260,
+                    )
+                    st.plotly_chart(fig_l, use_container_width=True)
+
+                # Full realized table
+                with st.expander(f"📋 All closed positions ({len(rdf)} stocks)"):
+                    rdf_disp = rdf.copy()
+                    if proc_col:
+                        rdf_disp["Proceeds"]   = rdf_disp[proc_col[0]].map(lambda x: f"${x:,.2f}")
+                    if cb_col:
+                        rdf_disp["Cost Basis"] = rdf_disp[cb_col[0]].map(lambda x: f"${x:,.2f}")
+                    rdf_disp["P&L (USD)"] = rdf_disp[pnl_col[0]].map(
+                        lambda x: f"+${x:,.2f}" if x >= 0 else f"-${abs(x):,.2f}")
+                    if pct_col:
+                        rdf_disp["P&L (%)"] = rdf_disp[pct_col[0]].map(
+                            lambda x: f"+{x:.2f}%" if x >= 0 else f"{x:.2f}%")
+                    show_cols = ["Security", "Quantity"]
+                    for c in ["Proceeds","Cost Basis","P&L (USD)","P&L (%)"]:
+                        if c in rdf_disp.columns:
+                            show_cols.append(c)
+                    st.dataframe(rdf_disp[show_cols], use_container_width=True, hide_index=True)
+
+        # ── Trade activity ─────────────────────────────────────────────────────
+        if not vdata["trades"].empty:
+            st.markdown("---")
+            st.markdown("### 🔄 Trade Activity by Stock")
+            tdf = vdata["trades"].copy()
+            act_col  = "Activity"
+            name_col = "Name" if "Name" in tdf.columns else "Ticker"
+            tick_col = "Ticker"
+
+            # Group by Ticker
+            grp = tdf.groupby(tick_col)
+            rows = []
+            for ticker, grp_df in grp:
+                name = grp_df[name_col].iloc[0] if name_col in grp_df.columns else ticker
+                buys  = grp_df[grp_df[act_col] == "Buy"]
+                sells = grp_df[grp_df[act_col] == "Sell"]
+                cash_col = "Cash Amount (in USD)"
+                buy_val  = buys[cash_col].sum()  if cash_col in buys.columns  else 0
+                sell_val = sells[cash_col].sum() if cash_col in sells.columns else 0
+                rows.append({
+                    "Ticker": ticker,
+                    "Company": name[:30] + "…" if len(name) > 30 else name,
+                    "Buy Trades":  len(buys),
+                    "Sell Trades": len(sells),
+                    "Buy Value ($)":  f"${buy_val:,.2f}",
+                    "Sell Value ($)": f"${sell_val:,.2f}",
+                })
+            act_df = pd.DataFrame(rows).sort_values("Buy Trades", ascending=False)
+            st.dataframe(act_df, use_container_width=True, hide_index=True)
+
+        # ── Deposits / Transfers ───────────────────────────────────────────────
+        if not vdata["transfers"].empty:
+            st.markdown("---")
+            st.markdown("### 🏦 Fund Transfers (Deposits)")
+            trf = vdata["transfers"].copy()
+            trf["Date"] = trf["Date"].dt.strftime("%d %b %Y")
+            trf["Amount (USD)"] = trf["amount_usd"].map(lambda x: f"${x:,.2f}")
+            trf["Amount (INR)"] = trf["amount_usd"].map(lambda x: fmt_inr(x * usd_to_inr))
+            show_cols = ["Date", "Activity", "Amount (USD)", "Amount (INR)"]
+            show_cols = [c for c in show_cols if c in trf.columns]
+            st.dataframe(trf[show_cols], use_container_width=True, hide_index=True)
+
+            st.success(f"**Total Deposited: ${total_deposited:,.2f}** "
+                       f"(≈ {fmt_inr(total_deposited * usd_to_inr)})")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PAGE: SETTINGS
+# ══════════════════════════════════════════════════════════════════════════════
+if nav == "⚙️ Settings":
+    st.title("⚙️ Settings")
+
+    st.markdown("### Angel One (India) — SmartAPI Credentials")
+
+    # Show whether credentials are coming from env vars or settings file
+    env_keys = ["ANGEL_API_KEY", "ANGEL_CLIENT_ID", "ANGEL_PASSWORD", "ANGEL_TOTP_SECRET"]
+    using_env = all(_os.environ.get(k, "").strip() for k in env_keys)
+    if using_env:
+        st.success("✅ Credentials loaded from **environment variables** (Railway deployment). "
+                   "To change them, update the Variables in your Railway project dashboard.")
+    else:
+        st.info("Get your API key from [Angel One SmartAPI](https://smartapi.angelbroking.com/). "
+                "Enable TOTP in your Angel One app to get the TOTP secret.")
+
+    with st.form("angel_settings"):
+        col1, col2 = st.columns(2)
+        with col1:
+            angel_key    = st.text_input("API Key",       value=settings.get("angel_api_key", ""),    type="password")
+            angel_id     = st.text_input("Client ID",     value=settings.get("angel_client_id", ""))
+        with col2:
+            angel_pass   = st.text_input("Password/PIN",  value=settings.get("angel_password", ""),   type="password")
+            angel_totp   = st.text_input("TOTP Secret",   value=settings.get("angel_totp_secret", ""),type="password")
+
+        if st.form_submit_button("💾 Save Angel One Settings", use_container_width=True):
+            settings.update({
+                "angel_api_key":     angel_key,
+                "angel_client_id":   angel_id,
+                "angel_password":    angel_pass,
+                "angel_totp_secret": angel_totp,
+            })
+            save_json(SETTINGS_FILE, settings)
+            st.session_state.settings = settings
+            st.success("✅ Angel One credentials saved!")
+
+    st.markdown("---")
+    st.markdown("### Display Preferences")
+    with st.form("display_settings"):
+        base_currency = st.selectbox(
+            "Base currency for totals",
+            ["INR (₹)", "USD ($)", "GBP (£)"],
+            index=["INR (₹)", "USD ($)", "GBP (£)"].index(settings.get("base_currency", "INR (₹)")),
+        )
+        if st.form_submit_button("💾 Save Display Settings", use_container_width=True):
+            settings["base_currency"] = base_currency
+            save_json(SETTINGS_FILE, settings)
+            st.session_state.settings = settings
+            st.success("✅ Display settings saved!")
+
+    st.markdown("---")
+    st.markdown("### ℹ️ About Vested & JP Morgan")
+    st.warning(
+        "**Vested Finance** and **JP Morgan Workplace Solutions** do not offer public APIs. "
+        "You can manage your US and UK holdings manually in their respective tabs, "
+        "or import them using a CSV file. Live prices will be fetched automatically via Yahoo Finance."
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PAGE: INDIA (Angel One)
+# ══════════════════════════════════════════════════════════════════════════════
+elif nav == "🇮🇳 India (Angel One)":
+    st.title("🇮🇳 India Portfolio — Angel One")
+
+    # Check credentials
+    has_creds = all([
+        settings.get("angel_api_key"),
+        settings.get("angel_client_id"),
+        settings.get("angel_password"),
+        settings.get("angel_totp_secret"),
+    ])
+
+    if not has_creds:
+        st.warning("⚠️ Angel One credentials not configured. Go to **⚙️ Settings** to add them.")
+        st.stop()
+
+    col_btn, col_status = st.columns([2, 5])
+    with col_btn:
+        fetch_clicked = st.button("🔌 Connect & Fetch Holdings", use_container_width=True)
+
+    if fetch_clicked:
+        with st.spinner("Connecting to Angel One..."):
+            try:
+                from utils.angel_api import AngelOneClient
+                client = AngelOneClient(
+                    api_key=settings["angel_api_key"],
+                    client_id=settings["angel_client_id"],
+                    password=settings["angel_password"],
+                    totp_secret=settings["angel_totp_secret"],
+                )
+                df, error = client.get_holdings()
+                if error:
+                    st.session_state.angel_error = error
+                    st.session_state.angel_holdings = None
+                else:
+                    st.session_state.angel_holdings = df
+                    st.session_state.angel_error = None
+                    st.session_state.last_refresh = datetime.now().strftime("%H:%M:%S")
+            except Exception as e:
+                st.session_state.angel_error = str(e)
+                st.session_state.angel_holdings = None
+
+    if st.session_state.angel_error:
+        st.error(f"❌ {st.session_state.angel_error}")
+
+    df = st.session_state.angel_holdings
+
+    if df is not None and not df.empty:
+        st.markdown('<span class="success-badge">✓ Connected</span>', unsafe_allow_html=True)
+
+        # ── Debug: show raw columns so we can verify field names ─────────────
+        with st.expander("🔍 Raw API data (for debugging)", expanded=False):
+            st.write("**Columns returned by Angel One:**", list(df.columns))
+            st.dataframe(df.head(3), use_container_width=True)
+
+        st.markdown("---")
+
+        # ── Derive missing columns from what Angel One does return ────────────
+        for col in ["quantity", "averageprice", "ltp", "profitandloss", "pnlpercentage"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+        # Angel One v2 doesn't return investedvalue / totvalue — compute them
+        if "investedvalue" not in df.columns:
+            df["investedvalue"] = df["quantity"] * df["averageprice"]
+        if "totvalue" not in df.columns:
+            df["totvalue"] = df["quantity"] * df["ltp"]
+        # Recompute P&L from derived values for accuracy
+        df["profitandloss"] = df["totvalue"] - df["investedvalue"]
+        df["pnlpercentage"] = (df["profitandloss"] / df["investedvalue"].replace(0, pd.NA)) * 100
+
+        # Compute totals
+        total_invested = df["investedvalue"].sum()
+        total_current  = df["totvalue"].sum()
+        total_pnl      = total_current - total_invested
+        pnl_pct        = (total_pnl / total_invested * 100) if total_invested else 0
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Invested (INR)",       fmt_inr(total_invested))
+        c2.metric("Current Value (INR)",  fmt_inr(total_current))
+        delta_color = "normal" if total_pnl >= 0 else "inverse"
+        c3.metric("Total P&L",            fmt_inr(total_pnl),    f"{pnl_pct:+.2f}%", delta_color=delta_color)
+        c4.metric("Holdings",             len(df))
+
+        st.markdown("---")
+
+        # ── Holdings table ────────────────────────────────────────────────────
+        st.markdown("### Holdings")
+        show_df = pd.DataFrame({
+            "Symbol":        df["tradingsymbol"],
+            "Qty":           df["quantity"],
+            "Avg Price":     df["averageprice"].apply(lambda x: f"₹{x:,.2f}"),
+            "LTP":           df["ltp"].apply(lambda x: f"₹{x:,.2f}"),
+            "Invested":      df["investedvalue"].apply(fmt_inr),
+            "Current Value": df["totvalue"].apply(fmt_inr),
+            "P&L":           df["profitandloss"].apply(fmt_inr),
+            "P&L %":         df["pnlpercentage"].apply(lambda x: f"{x:+.2f}%" if pd.notna(x) else "—"),
+        })
+
+        st.dataframe(show_df, use_container_width=True, hide_index=True)
+
+        # Also update session state with enriched df
+        st.session_state.angel_holdings = df
+
+        # ── Chart: P&L by stock ───────────────────────────────────────────────
+        if "profitandloss" in df.columns and "tradingsymbol" in df.columns:
+            st.markdown("### P&L by Stock")
+            chart_df = df[["tradingsymbol", "profitandloss"]].copy()
+            chart_df.columns = ["Symbol", "PnL"]
+            chart_df["PnL"] = pd.to_numeric(chart_df["PnL"], errors="coerce")
+            chart_df = chart_df.dropna().sort_values("PnL")
+            chart_df["Color"] = chart_df["PnL"].apply(lambda x: "#00C875" if x >= 0 else "#E2445C")
+
+            fig = go.Figure(go.Bar(
+                x=chart_df["PnL"],
+                y=chart_df["Symbol"],
+                orientation="h",
+                marker_color=chart_df["Color"],
+                text=chart_df["PnL"].apply(lambda x: fmt_inr(x)),
+                textposition="outside",
+            ))
+            fig.update_layout(
+                paper_bgcolor="#1E2130", plot_bgcolor="#1E2130",
+                font=dict(color="#C0C4D0"),
+                margin=dict(l=10, r=20, t=20, b=10),
+                height=max(300, len(chart_df) * 30),
+                xaxis=dict(showgrid=False, zeroline=True, zerolinecolor="#3E4460"),
+                yaxis=dict(showgrid=False),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+    else:
+        if not fetch_clicked:
+            st.info("Click **Connect & Fetch Holdings** to load your Angel One portfolio.")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PAGE: US (Vested)
+# ══════════════════════════════════════════════════════════════════════════════
+elif nav == "🇺🇸 US (Vested)":
+    st.title("🇺🇸 US Portfolio — Vested Finance")
+
+    import io as _io
+
+    # ── File uploader (optional — saved file loads automatically) ─────────────
+    with st.expander("📂 Update Holdings File", expanded=not VESTED_HOLDINGS_FILE.exists()):
+        col_up, col_hint = st.columns([2, 3])
+        with col_up:
+            vhf = st.file_uploader(
+                "Vested_Holdings.xlsx",
+                type=["xlsx"],
+                key="us_holdings_upload",
+                help="Download from Vested app → Portfolio → Export",
+            )
+        with col_hint:
+            if VESTED_HOLDINGS_FILE.exists():
+                st.success(f"Using saved holdings file — upload a new one to replace it.")
+            else:
+                st.info("Download from the Vested app:\n**Portfolio → menu → Export Holdings**")
+
+        if vhf:
+            raw = vhf.read()
+            with open(str(VESTED_HOLDINGS_FILE), "wb") as _f:
+                _f.write(raw)
+            st.success("Holdings file saved — will load automatically from now on.")
+            st.rerun()
+
+    with st.expander("📂 Update Transactions File", expanded=not VESTED_TRANSACTIONS_FILE.exists()):
+        col_t, col_th = st.columns([2, 3])
+        with col_t:
+            vtf = st.file_uploader(
+                "Vested_Transactions.xlsx",
+                type=["xlsx"],
+                key="us_txn_upload",
+                help="Download from Vested app → Transactions → Export",
+            )
+        with col_th:
+            if VESTED_TRANSACTIONS_FILE.exists():
+                st.success("Using saved transactions file — upload a new one to replace it.")
+            else:
+                st.info("Used to calculate **Total Deposited** on the Dashboard.")
+        if vtf:
+            raw = vtf.read()
+            with open(str(VESTED_TRANSACTIONS_FILE), "wb") as _f:
+                _f.write(raw)
+            st.success("Transactions file saved.")
+            st.rerun()
+
+    @st.cache_data(show_spinner=False)
+    def parse_vested_holdings(file_path_str):
+        xl = pd.ExcelFile(file_path_str)
+        summary = {}
+        holdings = pd.DataFrame()
+
+        if "Summary" in xl.sheet_names:
+            df = xl.parse("Summary")
+            df.columns = [c.strip() for c in df.columns]
+            if not df.empty:
+                row = df.iloc[0]
+                summary = {
+                    "current_value":  float(str(row.get("Current Equity Value (USD)",  0)).replace(",","").replace("%","") or 0),
+                    "total_invested": float(str(row.get("Total Amount Invested (USD)", 0)).replace(",","").replace("%","") or 0),
+                    "returns_usd":    float(str(row.get("Investment Returns (USD)",    0)).replace(",","").replace("%","") or 0),
+                    "returns_pct":    str(row.get("Investment Returns (%)", "0%")),
+                }
+
+        if "Holdings" in xl.sheet_names:
+            holdings = xl.parse("Holdings")
+            holdings.columns = [c.strip() for c in holdings.columns]
+            numeric_cols = [
+                "Total Shares Held", "Current Price (USD)", "Current Value (USD)",
+                "Average Cost (USD)", "Total Amount Invested (USD)",
+                "Investment Returns (USD)", "Investment Returns (%)",
+                "Daily Change (USD)", "Daily Change (%)",
+            ]
+            for col in numeric_cols:
+                if col in holdings.columns:
+                    holdings[col] = pd.to_numeric(holdings[col], errors="coerce")
+
+        return summary, holdings
+
+    if not VESTED_HOLDINGS_FILE.exists():
+        st.info("No holdings file found. Expand **Update Holdings File** above to upload one.")
+        st.stop()
+
+    summary, holdings = parse_vested_holdings(str(VESTED_HOLDINGS_FILE))
+    # Store in session state for Dashboard to use
+    st.session_state.us_vested_summary = summary
+
+    fx = st.session_state.get("fx_rates", {"USD": 84.0})
+    usd_inr = fx.get("USD", 84.0)
+
+    # ── Summary cards ──────────────────────────────────────────────────────────
+    st.markdown("---")
+    cv  = summary.get("current_value", 0)
+    inv = summary.get("total_invested", 0)
+    ret = summary.get("returns_usd", 0)
+    rp  = summary.get("returns_pct", "")
+
+    vc1, vc2, vc3, vc4 = st.columns(4)
+    vc1.metric("💵 Current Value",     f"${cv:,.2f}",  f"≈ {fmt_inr(cv * usd_inr)}")
+    vc2.metric("📥 Total Invested",    f"${inv:,.2f}", f"≈ {fmt_inr(inv * usd_inr)}")
+    vc3.metric("📈 Returns (USD)",     f"${ret:+,.2f}", rp,
+               delta_color="normal" if ret >= 0 else "inverse")
+    vc4.metric("🔢 Holdings",          str(len(holdings)))
+
+    st.markdown("---")
+
+    if holdings.empty:
+        st.warning("No holdings data found in the file.")
+        st.stop()
+
+    # ── Holdings table ─────────────────────────────────────────────────────────
+    st.markdown("### Holdings")
+    disp = pd.DataFrame()
+    disp["Company"]          = holdings.get("Name", holdings.get("Ticker", "—"))
+    disp["Ticker"]           = holdings.get("Ticker", "—")
+    disp["Shares"]           = holdings["Total Shares Held"].map(lambda x: f"{x:.4f}" if pd.notna(x) else "—")
+    disp["Avg Cost"]         = holdings["Average Cost (USD)"].map(lambda x: f"${x:,.2f}" if pd.notna(x) else "—")
+    disp["Current Price"]    = holdings["Current Price (USD)"].map(lambda x: f"${x:,.2f}" if pd.notna(x) else "—")
+    disp["Invested (USD)"]   = holdings["Total Amount Invested (USD)"].map(lambda x: f"${x:,.2f}" if pd.notna(x) else "—")
+    disp["Value (USD)"]      = holdings["Current Value (USD)"].map(lambda x: f"${x:,.2f}" if pd.notna(x) else "—")
+    disp["Value (INR)"]      = holdings["Current Value (USD)"].map(lambda x: fmt_inr(x * usd_inr) if pd.notna(x) else "—")
+    disp["Returns (USD)"]    = holdings["Investment Returns (USD)"].map(
+        lambda x: (f"+${x:,.2f}" if x >= 0 else f"-${abs(x):,.2f}") if pd.notna(x) else "—")
+    disp["Returns (%)"]      = holdings["Investment Returns (%)"].map(
+        lambda x: f"{x:+.2f}%" if pd.notna(x) else "—")
+    disp["Day Change"]       = holdings["Daily Change (USD)"].map(
+        lambda x: (f"+${x:,.2f}" if x >= 0 else f"-${abs(x):,.2f}") if pd.notna(x) else "—")
+
+    st.dataframe(disp, use_container_width=True, hide_index=True)
+
+    # ── P&L bar chart ──────────────────────────────────────────────────────────
+    st.markdown("### Returns by Stock")
+    pnl_col = "Investment Returns (USD)"
+    if pnl_col in holdings.columns:
+        chart = holdings[["Ticker", pnl_col, "Name"]].dropna().sort_values(pnl_col)
+        fig = px.bar(
+            chart, x=pnl_col, y="Ticker", orientation="h",
+            color=pnl_col,
+            color_continuous_scale=["#E2445C", "#F97316", "#22C55E"],
+            labels={pnl_col: "Returns (USD)", "Ticker": ""},
+            hover_data=["Name"],
+        )
+        fig.add_vline(x=0, line_color="#6b7280", line_dash="dash")
+        fig.update_layout(
+            paper_bgcolor="#1E2130", plot_bgcolor="#1E2130",
+            font=dict(color="#C0C4D0"),
+            coloraxis_showscale=False,
+            margin=dict(l=0, r=20, t=10, b=0),
+            height=max(280, len(chart) * 38),
+            xaxis=dict(showgrid=False, zeroline=False),
+            yaxis=dict(showgrid=False),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    # ── Store enriched holdings in session state for Dashboard ─────────────────
+    st.session_state.us_vested_summary  = summary
+    st.session_state.us_vested_holdings = holdings
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PAGE: UK (JP Morgan)
+# ══════════════════════════════════════════════════════════════════════════════
+elif nav == "🇬🇧 UK (JP Morgan)":
+    st.title("🇬🇧 UK Portfolio — JP Morgan Workplace Solutions")
+
+    uk_holdings = load_json(UK_HOLDINGS_FILE, [])
+
+    st.markdown("### Add / Manage UK Holdings")
+    st.info("JP Morgan WPS has no public API. Add holdings manually or import a CSV. "
+            "Live prices are fetched from Yahoo Finance automatically.\n\n"
+            "Use **.L suffix** for LSE stocks, e.g. `LLOY.L`, `BP.L`, `SHEL.L`")
+
+    # ── CSV import ─────────────────────────────────────────────────────────────
+    with st.expander("📂 Import from CSV", expanded=False):
+        st.markdown("CSV format: `Company, Ticker, Qty, Avg (GBP)` — multiple lots of the "
+                    "same ticker are combined with a weighted average price.")
+        uk_csv = st.file_uploader("Upload CSV", type=["csv"], key="uk_csv_upload")
+        if uk_csv:
+            import io as _io
+            try:
+                raw = pd.read_csv(_io.BytesIO(uk_csv.read()), encoding="utf-8-sig")
+                raw = raw.dropna(axis=1, how="all")
+                raw = raw[raw.columns[:4]]
+                raw.columns = ["company", "ticker", "qty", "avg_gbp"]
+                raw["qty"]     = pd.to_numeric(raw["qty"], errors="coerce")
+                raw["avg_gbp"] = pd.to_numeric(
+                    raw["avg_gbp"].astype(str).str.replace("£", "").str.strip(), errors="coerce")
+                raw = raw.dropna(subset=["ticker", "qty", "avg_gbp"])
+                imported = []
+                for ticker_val, grp in raw.groupby("ticker"):
+                    tq  = float(grp["qty"].sum())
+                    ti  = float((grp["qty"] * grp["avg_gbp"]).sum())
+                    imported.append({
+                        "ticker":        str(ticker_val),
+                        "name":          str(grp["company"].iloc[0]),
+                        "qty":           round(tq, 4),
+                        "avg_price_gbp": round(ti / tq, 4),
+                        "sector":        "",
+                    })
+                # Merge with existing (replace matching tickers)
+                existing = {h["ticker"]: h for h in uk_holdings}
+                for h in imported:
+                    existing[h["ticker"]] = h
+                uk_holdings = list(existing.values())
+                save_json(UK_HOLDINGS_FILE, uk_holdings)
+                st.success(f"✅ Imported {len(imported)} holding(s) from CSV")
+                st.rerun()
+            except Exception as e:
+                st.error(f"CSV parse error: {e}")
+
+    # ── Add holding form ───────────────────────────────────────────────────────
+    with st.expander("➕ Add a holding manually", expanded=len(uk_holdings) == 0):
+        with st.form("add_uk"):
+            fc1, fc2, fc3 = st.columns(3)
+            uk_ticker = fc1.text_input("Ticker (e.g. LLOY.L)")
+            uk_name   = fc2.text_input("Company Name")
+            uk_qty    = fc1.number_input("Quantity", min_value=0.0, step=0.01)
+            uk_price  = fc2.number_input("Avg Buy Price (GBP)", min_value=0.0, step=0.01)
+            uk_sector = fc3.text_input("Sector (optional)")
+            if st.form_submit_button("Add Holding"):
+                if uk_ticker and uk_qty > 0:
+                    uk_holdings.append({
+                        "ticker": uk_ticker.strip().upper(),
+                        "name": uk_name or uk_ticker.strip().upper(),
+                        "qty": uk_qty,
+                        "avg_price_gbp": uk_price,
+                        "sector": uk_sector,
+                    })
+                    save_json(UK_HOLDINGS_FILE, uk_holdings)
+                    st.success(f"Added {uk_ticker.upper()}")
+                    st.rerun()
+
+    if not uk_holdings:
+        st.info("No UK holdings yet. Add your first holding above.")
+        st.stop()
+
+    # ── Fetch live prices ──────────────────────────────────────────────────────
+    tickers = [h["ticker"] for h in uk_holdings]
+    with st.spinner("Fetching live prices…"):
+        try:
+            from utils.price_fetcher import get_prices_bulk, get_fx_rates
+            prices = get_prices_bulk(tickers)
+            fx     = get_fx_rates()
+            st.session_state.fx_rates = fx
+        except Exception:
+            prices = {}
+            fx     = {"GBP": 107.0, "USD": 84.0, "INR": 1.0}
+
+    gbp_inr = fx.get("GBP", 107.0)
+
+    rows = []
+    for h in uk_holdings:
+        t   = h["ticker"]
+        pi  = prices.get(t, {})
+        ltp = pi.get("price") or 0.0
+        # LSE prices sometimes quoted in pence — convert if > 500
+        if ltp > 500:
+            ltp = ltp / 100
+        qty     = float(h.get("qty", 0))
+        avg     = float(h.get("avg_price_gbp", 0))
+        invested = qty * avg
+        current  = qty * ltp
+        pnl      = current - invested
+        pnl_pct  = (pnl / invested * 100) if invested else 0
+        rows.append({
+            "Ticker":       t,
+            "Company":      h.get("name", t),
+            "Qty":          qty,
+            "Avg (GBP)":    f"£{avg:,.2f}",
+            "LTP (GBP)":    f"£{ltp:,.2f}" if ltp else "—",
+            "Invested":     f"£{invested:,.2f}",
+            "Value (GBP)":  f"£{current:,.2f}",
+            "Value (INR)":  fmt_inr(current * gbp_inr),
+            "P&L (GBP)":    f"£{pnl:+,.2f}",
+            "P&L %":        f"{pnl_pct:+.2f}%",
+            "_invested":    invested,
+            "_current":     current,
+            "_pnl":         pnl,
+        })
+
+    df_uk = pd.DataFrame(rows)
+    total_inv_gbp = df_uk["_invested"].sum()
+    total_cur_gbp = df_uk["_current"].sum()
+    total_pnl_gbp = df_uk["_pnl"].sum()
+    pnl_pct_total = (total_pnl_gbp / total_inv_gbp * 100) if total_inv_gbp else 0
+
+    kc1, kc2, kc3, kc4 = st.columns(4)
+    kc1.metric("Invested (GBP)",      f"£{total_inv_gbp:,.2f}", fmt_inr(total_inv_gbp * gbp_inr))
+    kc2.metric("Current Value (GBP)", f"£{total_cur_gbp:,.2f}", fmt_inr(total_cur_gbp * gbp_inr))
+    kc3.metric("P&L (GBP)",           f"£{total_pnl_gbp:+,.2f}", f"{pnl_pct_total:+.2f}%",
+               delta_color="normal" if total_pnl_gbp >= 0 else "inverse")
+    kc4.metric("Holdings",            str(len(df_uk)))
+
+    st.markdown("---")
+    st.markdown("### Holdings")
+    show_cols = ["Company","Ticker","Qty","Avg (GBP)","LTP (GBP)","Invested","Value (GBP)","Value (INR)","P&L (GBP)","P&L %"]
+    st.dataframe(df_uk[show_cols], use_container_width=True, hide_index=True)
+
+    # ── Delete holding ─────────────────────────────────────────────────────────
+    with st.expander("🗑️ Remove a holding"):
+        del_ticker = st.selectbox("Select ticker to remove", [h["ticker"] for h in uk_holdings])
+        if st.button("Remove", type="secondary"):
+            uk_holdings = [h for h in uk_holdings if h["ticker"] != del_ticker]
+            save_json(UK_HOLDINGS_FILE, uk_holdings)
+            st.success(f"Removed {del_ticker}")
+            st.rerun()
+
+    # ── P&L chart ──────────────────────────────────────────────────────────────
+    st.markdown("### P&L by Stock")
+    fig_uk = px.bar(
+        df_uk.sort_values("_pnl"), x="_pnl", y="Ticker", orientation="h",
+        color="_pnl", color_continuous_scale=["#E2445C","#F97316","#22C55E"],
+        labels={"_pnl": "P&L (GBP)", "Ticker": ""},
+    )
+    fig_uk.add_vline(x=0, line_color="#6b7280", line_dash="dash")
+    fig_uk.update_layout(
+        paper_bgcolor="#1E2130", plot_bgcolor="#1E2130",
+        font=dict(color="#C0C4D0"), coloraxis_showscale=False,
+        margin=dict(l=0, r=20, t=10, b=0),
+        height=max(280, len(df_uk) * 38),
+        xaxis=dict(showgrid=False), yaxis=dict(showgrid=False),
+    )
+    st.plotly_chart(fig_uk, use_container_width=True)
+
+    # Store for dashboard
+    st.session_state.uk_total_invested_gbp = total_inv_gbp
+    st.session_state.uk_total_current_gbp  = total_cur_gbp
+    st.session_state.uk_gbp_inr            = gbp_inr
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PAGE: DASHBOARD
+# ══════════════════════════════════════════════════════════════════════════════
+elif nav == "🏠 Dashboard":
+    st.title("🏠 Portfolio Dashboard")
+    st.markdown("Combined view across India 🇮🇳, US 🇺🇸 and UK 🇬🇧")
+
+    # ── Fetch FX rates ─────────────────────────────────────────────────────────
+    with st.spinner("Fetching FX rates…"):
+        try:
+            from utils.price_fetcher import get_fx_rates
+            fx = get_fx_rates()
+            st.session_state.fx_rates = fx
+        except Exception:
+            fx = {"USD": 84.0, "GBP": 107.0, "INR": 1.0}
+
+    usd_inr = fx.get("USD", 84.0)
+    gbp_inr = fx.get("GBP", 107.0)
+
+    # ── India data ─────────────────────────────────────────────────────────────
+    # Invested = net funds added from bank statement (Angel One + IPO transfers)
+    india_funds_data = load_json(str(INDIA_FUNDS_FILE), {})
+    india_invested   = float(india_funds_data.get("net_added", 0))
+    # Current value = live portfolio value from Angel One holdings
+    india_current  = 0.0
+    df_india = st.session_state.get("angel_holdings")
+    if df_india is not None and not df_india.empty:
+        if "totvalue" in df_india.columns:
+            india_current = float(df_india["totvalue"].sum())
+
+    # ── US data — invested = total deposited (Transfers), current = Holdings ───
+    us_invested_usd = 0.0
+    us_current_usd  = 0.0
+    if VESTED_TRANSACTIONS_FILE.exists():
+        try:
+            _xl = pd.ExcelFile(str(VESTED_TRANSACTIONS_FILE))
+            if "Transfers" in _xl.sheet_names:
+                _trf = _xl.parse("Transfers")
+                _trf.columns = [c.strip() for c in _trf.columns]
+                _amt = next((c for c in _trf.columns if "Cash Amount" in c), None)
+                if _amt:
+                    us_invested_usd = float(pd.to_numeric(_trf[_amt], errors="coerce").fillna(0).sum())
+        except Exception:
+            pass
+    if VESTED_HOLDINGS_FILE.exists():
+        try:
+            _xl = pd.ExcelFile(str(VESTED_HOLDINGS_FILE))
+            if "Summary" in _xl.sheet_names:
+                _s = _xl.parse("Summary")
+                _s.columns = [c.strip() for c in _s.columns]
+                if not _s.empty:
+                    us_current_usd = float(str(_s.iloc[0].get("Current Equity Value (USD)", 0)).replace(",","") or 0)
+        except Exception:
+            pass
+    us_invested_inr = us_invested_usd * usd_inr
+    us_current_inr  = us_current_usd  * usd_inr
+
+    # ── UK data ────────────────────────────────────────────────────────────────
+    uk_invested_inr = float(st.session_state.get("uk_total_invested_gbp", 0)) * gbp_inr
+    uk_current_inr  = float(st.session_state.get("uk_total_current_gbp",  0)) * gbp_inr
+
+    # ── Total across all markets ───────────────────────────────────────────────
+    total_invested = india_invested + us_invested_inr + uk_invested_inr
+    total_current  = india_current  + us_current_inr  + uk_current_inr
+    total_pnl      = total_current - total_invested
+    total_pnl_pct  = (total_pnl / total_invested * 100) if total_invested else 0
+
+    # ── Top-level metrics ──────────────────────────────────────────────────────
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("Total Invested",  fmt_inr(total_invested))
+    d2.metric("Current Value",   fmt_inr(total_current))
+    d3.metric("Total P&L",       fmt_inr(total_pnl),
+              f"{total_pnl_pct:+.2f}%",
+              delta_color="normal" if total_pnl >= 0 else "inverse")
+    d4.metric("Markets",         "India / US / UK")
+
+    st.markdown("---")
+
+    # Per-market breakdown
+    st.markdown("### Breakdown by Market")
+    mc1, mc2, mc3 = st.columns(3)
+
+    india_pnl = india_current - india_invested
+    with mc1:
+        st.markdown("#### India (Angel One)")
+        st.metric("Funds Added",   fmt_inr(india_invested),
+                  help="Net funds transferred from bank (Angel One + IPO)")
+        st.metric("Current Value", fmt_inr(india_current),
+                  help="Live portfolio value from Angel One holdings")
+        st.metric("P&L",           fmt_inr(india_pnl),
+                  delta_color="normal" if india_pnl >= 0 else "inverse")
+        if india_invested == 0:
+            st.caption("Go to Funds Added tab & upload bank statement")
+        if india_current == 0:
+            st.caption("Go to India tab & Connect to load live prices")
+
+    us_pnl = us_current_inr - us_invested_inr
+    with mc2:
+        st.markdown("#### US (Vested)")
+        st.metric("Total Deposited", fmt_inr(us_invested_inr),
+                  help=f"${us_invested_usd:,.2f} — total cash deposited into Vested account")
+        st.metric("Current Value", fmt_inr(us_current_inr),
+                  help=f"${us_current_usd:,.2f} — live market value from Holdings file")
+        st.metric("P&L",           fmt_inr(us_pnl),
+                  delta_color="normal" if us_pnl >= 0 else "inverse")
+        if us_invested_inr == 0:
+            st.caption("Go to US tab & upload Holdings file once")
+
+    uk_pnl = uk_current_inr - uk_invested_inr
+    with mc3:
+        st.markdown("#### UK (JP Morgan)")
+        st.metric("Invested", fmt_inr(uk_invested_inr))
+        st.metric("Current",  fmt_inr(uk_current_inr))
+        st.metric("P&L",      fmt_inr(uk_pnl),
+                  delta_color="normal" if uk_pnl >= 0 else "inverse")
+        if uk_invested_inr == 0:
+            st.caption("Go to UK tab & add holdings")
+
+    st.markdown("---")
+
+    # Allocation pie chart
+    if total_current > 0:
+        st.markdown("### Portfolio Allocation")
+        alloc_data = {
+            "Market": ["India", "US", "UK"],
+            "Value":  [max(india_current, 0), max(us_current_inr, 0), max(uk_current_inr, 0)],
+        }
+        alloc_df = pd.DataFrame(alloc_data)
+        alloc_df = alloc_df[alloc_df["Value"] > 0]
+        if not alloc_df.empty:
+            fig_pie = px.pie(
+                alloc_df, names="Market", values="Value",
+                color_discrete_sequence=["#4A90D9", "#22C55E", "#F59E0B"],
+                hole=0.45,
+            )
+            fig_pie.update_traces(textposition="outside", textinfo="label+percent")
+            fig_pie.update_layout(
+                paper_bgcolor="#1E2130",
+                font=dict(color="#C0C4D0"),
+                showlegend=True,
+                legend=dict(bgcolor="#1E2130"),
+                margin=dict(l=20, r=20, t=20, b=20),
+                height=380,
+            )
+            pc, _ = st.columns([2, 1])
+            with pc:
+                st.plotly_chart(fig_pie, use_container_width=True)
+
+    st.markdown("---")
+    fx1, fx2, fx3 = st.columns(3)
+    fx1.metric("USD / INR", f"{usd_inr:.2f}")
+    fx2.metric("GBP / INR", f"{gbp_inr:.2f}")
+    fx3.metric("Last Updated", datetime.now().strftime("%H:%M:%S"))

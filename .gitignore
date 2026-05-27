@@ -1,0 +1,22 @@
+# Credentials - never commit
+data/settings.json
+
+# Personal data files - upload via the app
+data/*.xlsx
+data/*.xls
+data/*.json
+
+# Keep data directory itself
+!data/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+logs/
+
+# Temp files
+~$*
+*.tmp
+trade_dashboard.html
