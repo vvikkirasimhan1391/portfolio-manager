@@ -1,13 +1,9 @@
 # Credentials - never commit
 data/settings.json
 
-# Personal data files - upload via the app
+# Large binary files - upload via the app UI
 data/*.xlsx
 data/*.xls
-data/*.json
-
-# Keep data directory itself
-!data/.gitkeep
 
 # Python
 __pycache__/
