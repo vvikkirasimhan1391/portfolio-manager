@@ -30,8 +30,10 @@ US_HOLDINGS_FILE     = DATA_DIR / "us_holdings.json"
 UK_HOLDINGS_FILE     = DATA_DIR / "uk_holdings.json"
 FUNDS_FILE           = DATA_DIR / "funds.json"
 INDIA_FUNDS_FILE     = DATA_DIR / "india_funds.json"
-VESTED_HOLDINGS_FILE      = DATA_DIR / "vested_holdings.xlsx"
-VESTED_TRANSACTIONS_FILE  = DATA_DIR / "vested_transactions.xlsx"
+UPLOADS_DIR               = DATA_DIR / "uploads"
+UPLOADS_DIR.mkdir(exist_ok=True)
+VESTED_HOLDINGS_FILE      = UPLOADS_DIR / "vested_holdings.xlsx"
+VESTED_TRANSACTIONS_FILE  = UPLOADS_DIR / "vested_transactions.xlsx"
 
 # ── Helpers ─────────────────────────────────────────────────────────────────────
 def load_json(path, default):
@@ -62,70 +64,174 @@ def colour_pnl(val):
 # ── Custom CSS ──────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-    /* Main background */
-    .stApp { background-color: #0F1117; }
+    /* ── Base ── */
+    .stApp { background-color: #0A0E1A; }
+    .block-container { padding: 1rem 1rem 2rem 1rem !important; max-width: 100% !important; }
 
-    /* Metric cards */
+    /* ── Typography ── */
+    h1 { font-size: clamp(1.4rem, 5vw, 2rem) !important; color: #F0F2FF !important;
+         background: linear-gradient(90deg, #60A5FA, #A78BFA);
+         -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+    h2 { font-size: clamp(1.1rem, 4vw, 1.5rem) !important; color: #E2E8FF !important; }
+    h3 { font-size: clamp(0.95rem, 3vw, 1.15rem) !important; color: #C8D0F0 !important; }
+    p, li { color: #9BA3C0; font-size: clamp(0.85rem, 2.5vw, 0.95rem); }
+
+    /* ── Metric cards — colourful gradient borders ── */
     div[data-testid="metric-container"] {
-        background: #1E2130;
-        border: 1px solid #2E3250;
-        border-radius: 12px;
-        padding: 16px 20px;
+        background: linear-gradient(135deg, #151929 0%, #1C2138 100%);
+        border: 1px solid transparent;
+        border-radius: 16px;
+        padding: 14px 16px;
+        position: relative;
+        box-shadow: 0 4px 20px rgba(0,0,0,0.4);
     }
-    div[data-testid="metric-container"] label { color: #8B92A5 !important; font-size: 13px; }
+    div[data-testid="metric-container"]::before {
+        content: "";
+        position: absolute; inset: 0;
+        border-radius: 16px;
+        padding: 1px;
+        background: linear-gradient(135deg, #60A5FA44, #A78BFA44, #34D39944);
+        -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+        -webkit-mask-composite: xor; mask-composite: exclude;
+        pointer-events: none;
+    }
+    div[data-testid="metric-container"] label {
+        color: #7B84A8 !important;
+        font-size: clamp(0.72rem, 2vw, 0.8rem) !important;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+    }
     div[data-testid="metric-container"] div[data-testid="metric-value"] {
-        font-size: 22px !important;
-        font-weight: 700;
-        color: #E8EAF0 !important;
+        font-size: clamp(1.1rem, 4vw, 1.5rem) !important;
+        font-weight: 700 !important;
+        color: #E8EEFF !important;
+    }
+    div[data-testid="metric-container"] div[data-testid="metric-delta"] {
+        font-size: clamp(0.75rem, 2vw, 0.85rem) !important;
     }
 
-    /* Tab styling */
-    div[data-baseweb="tab-list"] { background: #1E2130; border-radius: 10px; padding: 4px; }
-    div[data-baseweb="tab"] { color: #8B92A5 !important; }
-    div[data-baseweb="tab"][aria-selected="true"] {
-        background: #2E3A6E !important;
-        border-radius: 8px;
+    /* ── Sidebar ── */
+    section[data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #0D1120 0%, #111628 100%);
+        border-right: 1px solid #1E2540;
+    }
+    section[data-testid="stSidebar"] .stMarkdown p { color: #6B748F; font-size: 11px; }
+    section[data-testid="stSidebar"] h2 {
+        background: linear-gradient(90deg, #60A5FA, #A78BFA);
+        -webkit-background-clip: text; -webkit-text-fill-color: transparent !important;
+    }
+
+    /* ── Nav radio buttons (sidebar) ── */
+    div[data-testid="stSidebar"] .stRadio label {
+        background: transparent;
+        color: #8B93B8 !important;
+        border-radius: 10px;
+        padding: 8px 12px;
+        font-size: 0.9rem;
+        transition: all 0.2s;
+    }
+    div[data-testid="stSidebar"] .stRadio label:hover { background: #1A2040; color: #C8D0F0 !important; }
+    div[data-testid="stSidebar"] .stRadio input:checked + div {
+        background: linear-gradient(90deg, #1E3A6E, #2D1F5E) !important;
+        border-radius: 10px;
         color: #FFFFFF !important;
     }
 
-    /* Sidebar */
-    section[data-testid="stSidebar"] { background: #141722; }
-    section[data-testid="stSidebar"] .stMarkdown p { color: #8B92A5; font-size: 12px; }
+    /* ── Buttons ── */
+    .stButton > button {
+        background: linear-gradient(90deg, #2563EB, #7C3AED);
+        color: white !important;
+        border: none;
+        border-radius: 10px;
+        padding: 8px 18px;
+        font-weight: 600;
+        font-size: clamp(0.8rem, 2.5vw, 0.9rem);
+        box-shadow: 0 4px 15px rgba(99, 102, 241, 0.3);
+        transition: all 0.2s;
+    }
+    .stButton > button:hover {
+        background: linear-gradient(90deg, #1D4ED8, #6D28D9);
+        box-shadow: 0 4px 20px rgba(99, 102, 241, 0.5);
+        transform: translateY(-1px);
+    }
 
-    /* Dataframe */
-    div[data-testid="stDataFrameContainer"] { border-radius: 10px; }
+    /* ── Dataframe ── */
+    div[data-testid="stDataFrameContainer"] {
+        border-radius: 12px;
+        border: 1px solid #1E2540;
+        overflow: hidden;
+    }
 
-    /* Success / Error */
+    /* ── Tabs ── */
+    div[data-baseweb="tab-list"] {
+        background: #131829;
+        border-radius: 12px;
+        padding: 4px;
+        gap: 4px;
+    }
+    div[data-baseweb="tab"] { color: #7B84A8 !important; border-radius: 8px; }
+    div[data-baseweb="tab"][aria-selected="true"] {
+        background: linear-gradient(90deg, #1E3A6E, #2D1F5E) !important;
+        color: #FFFFFF !important;
+    }
+
+    /* ── Expanders ── */
+    div[data-testid="stExpander"] {
+        background: #131829;
+        border: 1px solid #1E2540 !important;
+        border-radius: 12px !important;
+    }
+
+    /* ── Info / Warning / Success boxes ── */
+    div[data-testid="stAlert"] { border-radius: 12px; font-size: 0.88rem; }
+
+    /* ── Divider ── */
+    hr { border-color: #1E2540 !important; margin: 1rem 0 !important; }
+
+    /* ── Section headers with colour accent ── */
+    .section-india  { color: #FB923C !important; }
+    .section-us     { color: #60A5FA !important; }
+    .section-uk     { color: #A78BFA !important; }
+
+    /* ── Badges ── */
     .success-badge {
         display: inline-block;
-        background: rgba(0,200,117,0.15);
-        color: #00C875;
-        border: 1px solid rgba(0,200,117,0.3);
-        border-radius: 20px;
-        padding: 2px 12px;
-        font-size: 12px;
-        font-weight: 600;
+        background: rgba(52,211,153,0.15);
+        color: #34D399;
+        border: 1px solid rgba(52,211,153,0.3);
+        border-radius: 20px; padding: 3px 12px;
+        font-size: 12px; font-weight: 600;
     }
     .error-badge {
         display: inline-block;
-        background: rgba(226,68,92,0.15);
-        color: #E2445C;
-        border: 1px solid rgba(226,68,92,0.3);
-        border-radius: 20px;
-        padding: 2px 12px;
-        font-size: 12px;
-        font-weight: 600;
+        background: rgba(239,68,68,0.15);
+        color: #EF4444;
+        border: 1px solid rgba(239,68,68,0.3);
+        border-radius: 20px; padding: 3px 12px;
+        font-size: 12px; font-weight: 600;
     }
 
-    h1, h2, h3 { color: #E8EAF0 !important; }
-    p { color: #C0C4D0; }
-    .stButton>button {
-        background: #2E3A6E;
-        color: white;
-        border: none;
-        border-radius: 8px;
+    /* ── Mobile — stack columns nicely ── */
+    @media (max-width: 640px) {
+        .block-container { padding: 0.5rem 0.5rem 2rem 0.5rem !important; }
+        div[data-testid="metric-container"] { padding: 10px 12px; }
+        div[data-testid="metric-container"] div[data-testid="metric-value"] {
+            font-size: 1.1rem !important;
+        }
+        div[data-testid="column"] { min-width: 45% !important; }
     }
-    .stButton>button:hover { background: #3D4E8C; }
+
+    /* ── Input fields ── */
+    .stTextInput input, .stNumberInput input, .stSelectbox select {
+        background: #131829 !important;
+        border: 1px solid #2A3050 !important;
+        border-radius: 8px !important;
+        color: #E2E8FF !important;
+    }
+    .stTextInput input:focus, .stNumberInput input:focus {
+        border-color: #6366F1 !important;
+        box-shadow: 0 0 0 2px rgba(99,102,241,0.2) !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -1801,8 +1907,16 @@ elif nav == "🏠 Dashboard":
     # ── UK data ────────────────────────────────────────────────────────────────
     uk_invested_inr = float(st.session_state.get("uk_total_invested_gbp", 0)) * gbp_inr
     uk_current_inr  = float(st.session_state.get("uk_total_current_gbp",  0)) * gbp_inr
+    # Also try loading from file if session state empty
+    if uk_invested_inr == 0:
+        try:
+            uk_h = load_json(str(UK_HOLDINGS_FILE), [])
+            for h in uk_h:
+                uk_invested_inr += float(h.get("qty",0)) * float(h.get("avg_price_gbp",0)) * gbp_inr
+        except Exception:
+            pass
 
-    # ── Total across all markets ───────────────────────────────────────────────
+    # ── Totals ─────────────────────────────────────────────────────────────────
     total_invested = india_invested + us_invested_inr + uk_invested_inr
     total_current  = india_current  + us_current_inr  + uk_current_inr
     total_pnl      = total_current - total_invested
@@ -1819,7 +1933,7 @@ elif nav == "🏠 Dashboard":
 
     st.markdown("---")
 
-    # Per-market breakdown
+    # ── Per-market breakdown ───────────────────────────────────────────────────
     st.markdown("### Breakdown by Market")
     mc1, mc2, mc3 = st.columns(3)
 
@@ -1841,10 +1955,10 @@ elif nav == "🏠 Dashboard":
     with mc2:
         st.markdown("#### US (Vested)")
         st.metric("Total Deposited", fmt_inr(us_invested_inr),
-                  help=f"${us_invested_usd:,.2f} — total cash deposited into Vested account")
-        st.metric("Current Value", fmt_inr(us_current_inr),
-                  help=f"${us_current_usd:,.2f} — live market value from Holdings file")
-        st.metric("P&L",           fmt_inr(us_pnl),
+                  help=f"${us_invested_usd:,.2f} deposited into Vested account")
+        st.metric("Current Value",   fmt_inr(us_current_inr),
+                  help=f"${us_current_usd:,.2f} live market value")
+        st.metric("P&L",             fmt_inr(us_pnl),
                   delta_color="normal" if us_pnl >= 0 else "inverse")
         if us_invested_inr == 0:
             st.caption("Go to US tab & upload Holdings file once")
@@ -1852,16 +1966,16 @@ elif nav == "🏠 Dashboard":
     uk_pnl = uk_current_inr - uk_invested_inr
     with mc3:
         st.markdown("#### UK (JP Morgan)")
-        st.metric("Invested", fmt_inr(uk_invested_inr))
-        st.metric("Current",  fmt_inr(uk_current_inr))
-        st.metric("P&L",      fmt_inr(uk_pnl),
+        st.metric("Invested",      fmt_inr(uk_invested_inr))
+        st.metric("Current Value", fmt_inr(uk_current_inr))
+        st.metric("P&L",           fmt_inr(uk_pnl),
                   delta_color="normal" if uk_pnl >= 0 else "inverse")
         if uk_invested_inr == 0:
             st.caption("Go to UK tab & add holdings")
 
     st.markdown("---")
 
-    # Allocation pie chart
+    # ── Allocation pie chart ───────────────────────────────────────────────────
     if total_current > 0:
         st.markdown("### Portfolio Allocation")
         alloc_data = {
@@ -1873,17 +1987,19 @@ elif nav == "🏠 Dashboard":
         if not alloc_df.empty:
             fig_pie = px.pie(
                 alloc_df, names="Market", values="Value",
-                color_discrete_sequence=["#4A90D9", "#22C55E", "#F59E0B"],
+                color_discrete_sequence=["#FB923C", "#60A5FA", "#A78BFA"],
                 hole=0.45,
             )
-            fig_pie.update_traces(textposition="outside", textinfo="label+percent")
+            fig_pie.update_traces(textposition="outside", textinfo="label+percent",
+                                  textfont=dict(size=13))
             fig_pie.update_layout(
-                paper_bgcolor="#1E2130",
-                font=dict(color="#C0C4D0"),
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                font=dict(color="#C8D0F0"),
                 showlegend=True,
-                legend=dict(bgcolor="#1E2130"),
+                legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(size=12)),
                 margin=dict(l=20, r=20, t=20, b=20),
-                height=380,
+                height=360,
             )
             pc, _ = st.columns([2, 1])
             with pc:
