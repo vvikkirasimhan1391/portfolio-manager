@@ -1937,9 +1937,12 @@ elif nav == "🏠 Dashboard":
     india_current_sgd  = 0.0
     india_daily_sgd    = 0.0
     india_daily_pct    = 0.0
+    india_current_inr  = 0.0
+    india_daily_inr_val= 0.0
 
     india_funds_data   = load_json(str(INDIA_FUNDS_FILE), {})
-    india_invested_sgd = float(india_funds_data.get("net_added", 0)) * inr_sgd
+    india_invested_inr = float(india_funds_data.get("net_added", 0))
+    india_invested_sgd = india_invested_inr * inr_sgd
 
     df_india = st.session_state.get("angel_holdings")
 
@@ -1976,12 +1979,13 @@ elif nav == "🏠 Dashboard":
 
     if df_india is not None and not df_india.empty:
         if "totvalue" in df_india.columns:
-            india_current_sgd = float(df_india["totvalue"].sum()) * inr_sgd
+            india_current_inr  = float(df_india["totvalue"].sum())
+            india_current_sgd  = india_current_inr * inr_sgd
         if all(c in df_india.columns for c in ["ltp","close","quantity"]):
-            daily_inr = float(((df_india["ltp"] - df_india["close"]) * df_india["quantity"]).sum())
-            india_daily_sgd = daily_inr * inr_sgd
-            base = float(df_india["totvalue"].sum()) - daily_inr
-            india_daily_pct = (daily_inr / base * 100) if base else 0
+            india_daily_inr_val = float(((df_india["ltp"] - df_india["close"]) * df_india["quantity"]).sum())
+            india_daily_sgd = india_daily_inr_val * inr_sgd
+            base = india_current_inr - india_daily_inr_val
+            india_daily_pct = (india_daily_inr_val / base * 100) if base else 0
 
     # ════════════════════════════════════════════════════════════════
     #  US — saved files + live prices
@@ -1990,6 +1994,9 @@ elif nav == "🏠 Dashboard":
     us_current_sgd  = 0.0
     us_daily_sgd    = 0.0
     us_daily_pct    = 0.0
+    us_invested_usd = 0.0
+    us_current_usd  = 0.0
+    us_daily_usd    = 0.0
 
     if VESTED_TRANSACTIONS_FILE.exists():
         try:
@@ -1998,7 +2005,8 @@ elif nav == "🏠 Dashboard":
             _trf.columns = [c.strip() for c in _trf.columns]
             _amt = next((c for c in _trf.columns if "Cash Amount" in c), None)
             if _amt:
-                us_invested_sgd = float(pd.to_numeric(_trf[_amt], errors="coerce").fillna(0).sum()) * usd_sgd
+                us_invested_usd = float(pd.to_numeric(_trf[_amt], errors="coerce").fillna(0).sum())
+                us_invested_sgd = us_invested_usd * usd_sgd
         except Exception:
             pass
 
@@ -2012,8 +2020,6 @@ elif nav == "🏠 Dashboard":
                     _hdf[col] = pd.to_numeric(_hdf[col], errors="coerce").fillna(0)
             tickers_us = _hdf["Ticker"].dropna().tolist()
             lp_us = get_prices_bulk(tickers_us) if tickers_us else {}
-            us_current_usd = 0.0
-            us_daily_usd   = 0.0
             for _, row in _hdf.iterrows():
                 t   = row.get("Ticker","")
                 qty = float(row.get("Total Shares Held", 0) or 0)
@@ -2086,25 +2092,71 @@ elif nav == "🏠 Dashboard":
     st.markdown("---")
 
     # ════════════════════════════════════════════════════════════════
-    #  PER-MARKET BREAKDOWN
+    #  PER-MARKET BREAKDOWN  (native currencies)
     # ════════════════════════════════════════════════════════════════
     st.markdown("### Breakdown by Market")
 
-    for market, label, invested, current, daily, daily_pct in [
-        ("🇮🇳 India (Angel One)", "India", india_invested_sgd, india_current_sgd, india_daily_sgd, india_daily_pct),
-        ("🇺🇸 US (Vested)",       "US",    us_invested_sgd,    us_current_sgd,    us_daily_sgd,    us_daily_pct),
-        ("🇬🇧 UK (JP Morgan)",    "UK",    uk_invested_sgd,    uk_current_sgd,    uk_daily_sgd,    uk_daily_pct),
-    ]:
-        pnl     = current - invested
-        pnl_pct = (pnl / invested * 100) if invested else 0
-        with st.expander(f"{market}  |  {fmt_sgd_plain(current)}  {('+' if pnl>=0 else '')}{pnl_pct:.1f}%", expanded=True):
-            c1, c2, c3, c4 = st.columns(4)
-            with c1: dash_metric("Invested/Deposited", fmt_sgd_plain(invested))
-            with c2: dash_metric("Current Value",      fmt_sgd_plain(current))
-            with c3: dash_metric("P&L",                fmt_sgd_signed(pnl),
-                                  f"{pnl_pct:+.2f}%",  positive=pnl >= 0)
-            with c4: dash_metric("Today's Change",     fmt_sgd_signed(daily),
-                                  f"{daily_pct:+.2f}%", positive=daily >= 0)
+    def fmt_inr_plain(v):
+        try: return f"₹{float(v):,.2f}"
+        except: return "—"
+    def fmt_inr_signed(v):
+        try:
+            v = float(v)
+            return f"+₹{v:,.2f}" if v >= 0 else f"-₹{abs(v):,.2f}"
+        except: return "—"
+    def fmt_usd_plain(v):
+        try: return f"${float(v):,.2f}"
+        except: return "—"
+    def fmt_usd_signed(v):
+        try:
+            v = float(v)
+            return f"+${v:,.2f}" if v >= 0 else f"-${abs(v):,.2f}"
+        except: return "—"
+
+    # India — INR
+    india_pnl     = india_current_inr - india_invested_inr
+    india_pnl_pct = (india_pnl / india_invested_inr * 100) if india_invested_inr else 0
+    with st.expander(
+        f"🇮🇳 India (Angel One)  |  {fmt_inr_plain(india_current_inr)}  {('+' if india_pnl>=0 else '')}{india_pnl_pct:.1f}%",
+        expanded=True
+    ):
+        c1, c2, c3, c4 = st.columns(4)
+        with c1: dash_metric("Funds Added (INR)",  fmt_inr_plain(india_invested_inr))
+        with c2: dash_metric("Current Value (INR)", fmt_inr_plain(india_current_inr))
+        with c3: dash_metric("P&L",                 fmt_inr_signed(india_pnl),
+                              f"{india_pnl_pct:+.2f}%", positive=india_pnl >= 0)
+        with c4: dash_metric("Today's Change",      fmt_inr_signed(india_daily_inr_val),
+                              f"{india_daily_pct:+.2f}%", positive=india_daily_inr_val >= 0)
+
+    # US — USD
+    us_pnl     = us_current_usd - us_invested_usd
+    us_pnl_pct = (us_pnl / us_invested_usd * 100) if us_invested_usd else 0
+    with st.expander(
+        f"🇺🇸 US (Vested)  |  {fmt_usd_plain(us_current_usd)}  {('+' if us_pnl>=0 else '')}{us_pnl_pct:.1f}%",
+        expanded=True
+    ):
+        c1, c2, c3, c4 = st.columns(4)
+        with c1: dash_metric("Deposited (USD)",    fmt_usd_plain(us_invested_usd))
+        with c2: dash_metric("Current Value (USD)", fmt_usd_plain(us_current_usd))
+        with c3: dash_metric("P&L",                 fmt_usd_signed(us_pnl),
+                              f"{us_pnl_pct:+.2f}%", positive=us_pnl >= 0)
+        with c4: dash_metric("Today's Change",      fmt_usd_signed(us_daily_usd),
+                              f"{us_daily_pct:+.2f}%", positive=us_daily_usd >= 0)
+
+    # UK — SGD
+    uk_pnl     = uk_current_sgd - uk_invested_sgd
+    uk_pnl_pct = (uk_pnl / uk_invested_sgd * 100) if uk_invested_sgd else 0
+    with st.expander(
+        f"🇬🇧 UK (JP Morgan)  |  {fmt_sgd_plain(uk_current_sgd)}  {('+' if uk_pnl>=0 else '')}{uk_pnl_pct:.1f}%",
+        expanded=True
+    ):
+        c1, c2, c3, c4 = st.columns(4)
+        with c1: dash_metric("Invested (SGD)",      fmt_sgd_plain(uk_invested_sgd))
+        with c2: dash_metric("Current Value (SGD)", fmt_sgd_plain(uk_current_sgd))
+        with c3: dash_metric("P&L",                 fmt_sgd_signed(uk_pnl),
+                              f"{uk_pnl_pct:+.2f}%", positive=uk_pnl >= 0)
+        with c4: dash_metric("Today's Change",      fmt_sgd_signed(uk_daily_sgd),
+                              f"{uk_daily_pct:+.2f}%", positive=uk_daily_sgd >= 0)
 
     # ════════════════════════════════════════════════════════════════
     #  FX RATES
