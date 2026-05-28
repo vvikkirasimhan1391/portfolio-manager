@@ -1890,34 +1890,69 @@ elif nav == "🇬🇧 UK (JP Morgan)":
 # ══════════════════════════════════════════════════════════════════════════════
 elif nav == "🏠 Dashboard":
     st.title("🏠 Portfolio Dashboard")
-    st.markdown("Combined view across India 🇮🇳, US 🇺🇸 and UK 🇬🇧")
 
-    # ── Fetch FX rates ─────────────────────────────────────────────────────────
-    with st.spinner("Fetching FX rates…"):
+    # ── Fetch FX + all market data fresh every time ────────────────────────────
+    with st.spinner("Loading dashboard…"):
         try:
-            from utils.price_fetcher import get_fx_rates
+            from utils.price_fetcher import get_fx_rates, get_prices_bulk
             fx = get_fx_rates()
             st.session_state.fx_rates = fx
         except Exception:
-            fx = {"USD": 84.0, "GBP": 107.0, "INR": 1.0}
+            fx = {"USD": 84.0, "GBP": 107.0, "INR": 1.0,
+                  "USD_SGD": 1.35, "GBP_SGD": 1.71, "INR_SGD": 0.016}
 
-    usd_inr = fx.get("USD", 84.0)
-    gbp_inr = fx.get("GBP", 107.0)
+    usd_sgd = fx.get("USD_SGD", 1.35)
+    gbp_sgd = fx.get("GBP_SGD", 1.71)
+    inr_sgd = fx.get("INR_SGD", 0.016)
 
-    # ── India data ─────────────────────────────────────────────────────────────
-    # Invested = net funds added from bank statement (Angel One + IPO transfers)
-    india_funds_data = load_json(str(INDIA_FUNDS_FILE), {})
-    india_invested   = float(india_funds_data.get("net_added", 0))
-    # Current value = live portfolio value from Angel One holdings
-    india_current  = 0.0
+    def fmt_sgd(v):
+        if v is None: return "—"
+        try:
+            v = float(v)
+            sign = "+" if v > 0 else ""
+            return f"S${v:,.2f}" if v >= 0 else f"-S${abs(v):,.2f}"
+        except:
+            return "—"
+
+    def fmt_sgd_plain(v):
+        try: return f"S${float(v):,.2f}"
+        except: return "—"
+
+    # ════════════════════════════════════════════════════════════════
+    #  INDIA — fetch live from Angel One if creds available
+    # ════════════════════════════════════════════════════════════════
+    india_invested_sgd = 0.0
+    india_current_sgd  = 0.0
+    india_daily_sgd    = 0.0
+    india_daily_pct    = 0.0
+    india_status       = "no_data"
+
+    india_funds_data   = load_json(str(INDIA_FUNDS_FILE), {})
+    india_invested_inr = float(india_funds_data.get("net_added", 0))
+    india_invested_sgd = india_invested_inr * inr_sgd
+
     df_india = st.session_state.get("angel_holdings")
     if df_india is not None and not df_india.empty:
         if "totvalue" in df_india.columns:
-            india_current = float(df_india["totvalue"].sum())
+            india_current_sgd = float(df_india["totvalue"].sum()) * inr_sgd
+        # Daily change: sum of (ltp - close) * qty if available
+        if all(c in df_india.columns for c in ["ltp", "close", "quantity"]):
+            daily_inr = ((df_india["ltp"] - df_india["close"]) * df_india["quantity"]).sum()
+            india_daily_sgd = daily_inr * inr_sgd
+            base = float(df_india["totvalue"].sum()) - daily_inr
+            india_daily_pct = (daily_inr / base * 100) if base else 0
+        india_status = "live"
+    else:
+        india_status = "needs_connect"
 
-    # ── US data — invested = total deposited (Transfers), current = Holdings ───
-    us_invested_usd = 0.0
-    us_current_usd  = 0.0
+    # ════════════════════════════════════════════════════════════════
+    #  US — read from saved files + live prices
+    # ════════════════════════════════════════════════════════════════
+    us_invested_sgd = 0.0
+    us_current_sgd  = 0.0
+    us_daily_sgd    = 0.0
+    us_daily_pct    = 0.0
+
     if VESTED_TRANSACTIONS_FILE.exists():
         try:
             _xl = pd.ExcelFile(str(VESTED_TRANSACTIONS_FILE))
@@ -1926,125 +1961,149 @@ elif nav == "🏠 Dashboard":
                 _trf.columns = [c.strip() for c in _trf.columns]
                 _amt = next((c for c in _trf.columns if "Cash Amount" in c), None)
                 if _amt:
-                    us_invested_usd = float(pd.to_numeric(_trf[_amt], errors="coerce").fillna(0).sum())
+                    us_invested_sgd = float(pd.to_numeric(_trf[_amt], errors="coerce").fillna(0).sum()) * usd_sgd
         except Exception:
             pass
+
     if VESTED_HOLDINGS_FILE.exists():
         try:
-            _xl = pd.ExcelFile(str(VESTED_HOLDINGS_FILE))
-            if "Summary" in _xl.sheet_names:
-                _s = _xl.parse("Summary")
-                _s.columns = [c.strip() for c in _s.columns]
-                if not _s.empty:
-                    us_current_usd = float(str(_s.iloc[0].get("Current Equity Value (USD)", 0)).replace(",","") or 0)
+            _xl  = pd.ExcelFile(str(VESTED_HOLDINGS_FILE))
+            _hdf = _xl.parse("Holdings")
+            _hdf.columns = [c.strip() for c in _hdf.columns]
+            for col in ["Total Shares Held","Average Cost (USD)","Total Amount Invested (USD)"]:
+                if col in _hdf.columns:
+                    _hdf[col] = pd.to_numeric(_hdf[col], errors="coerce")
+            tickers_us = _hdf["Ticker"].dropna().tolist()
+            lp_us = get_prices_bulk(tickers_us) if tickers_us else {}
+
+            us_current_usd = 0.0
+            us_daily_usd   = 0.0
+            for _, row in _hdf.iterrows():
+                t   = row.get("Ticker","")
+                qty = float(row.get("Total Shares Held", 0) or 0)
+                pi  = lp_us.get(t, {})
+                pr  = pi.get("price") or 0
+                dcp = pi.get("daily_change_pct") or 0
+                us_current_usd += qty * pr
+                prev = pr / (1 + dcp/100) if (1 + dcp/100) != 0 else pr
+                us_daily_usd   += qty * (pr - prev)
+
+            us_current_sgd = us_current_usd * usd_sgd
+            us_daily_sgd   = us_daily_usd   * usd_sgd
+            base_us = us_current_usd - us_daily_usd
+            us_daily_pct = (us_daily_usd / base_us * 100) if base_us else 0
         except Exception:
             pass
-    us_invested_inr = us_invested_usd * usd_inr
-    us_current_inr  = us_current_usd  * usd_inr
 
-    # ── UK data ────────────────────────────────────────────────────────────────
-    uk_invested_inr = float(st.session_state.get("uk_total_invested_gbp", 0)) * gbp_inr
-    uk_current_inr  = float(st.session_state.get("uk_total_current_gbp",  0)) * gbp_inr
-    # Also try loading from file if session state empty
-    if uk_invested_inr == 0:
-        try:
-            uk_h = load_json(str(UK_HOLDINGS_FILE), [])
-            for h in uk_h:
-                uk_invested_inr += float(h.get("qty",0)) * float(h.get("avg_price_gbp",0)) * gbp_inr
-        except Exception:
-            pass
+    # ════════════════════════════════════════════════════════════════
+    #  UK — read from uk_holdings.json + live prices
+    # ════════════════════════════════════════════════════════════════
+    uk_invested_sgd = 0.0
+    uk_current_sgd  = 0.0
+    uk_daily_sgd    = 0.0
+    uk_daily_pct    = 0.0
 
-    # ── Totals ─────────────────────────────────────────────────────────────────
-    total_invested = india_invested + us_invested_inr + uk_invested_inr
-    total_current  = india_current  + us_current_inr  + uk_current_inr
+    uk_h = load_json(str(UK_HOLDINGS_FILE), [])
+    if uk_h:
+        tickers_uk = [h["ticker"] for h in uk_h]
+        lp_uk = get_prices_bulk(tickers_uk)
+        uk_current_gbp = 0.0
+        uk_invested_gbp = 0.0
+        uk_daily_gbp    = 0.0
+        for h in uk_h:
+            t   = h["ticker"]
+            qty = float(h.get("qty", 0))
+            avg = float(h.get("avg_price_gbp", 0))
+            pi  = lp_uk.get(t, {})
+            ltp = pi.get("price") or 0
+            if ltp > 500: ltp = ltp / 100
+            dcp = pi.get("daily_change_pct") or 0
+            prev = ltp / (1 + dcp/100) if (1 + dcp/100) != 0 else ltp
+            uk_invested_gbp += qty * avg
+            uk_current_gbp  += qty * ltp
+            uk_daily_gbp    += qty * (ltp - prev)
+        uk_invested_sgd = uk_invested_gbp * gbp_sgd
+        uk_current_sgd  = uk_current_gbp  * gbp_sgd
+        uk_daily_sgd    = uk_daily_gbp    * gbp_sgd
+        base_uk = uk_current_gbp - uk_daily_gbp
+        uk_daily_pct = (uk_daily_gbp / base_uk * 100) if base_uk else 0
+
+    # ════════════════════════════════════════════════════════════════
+    #  TOTALS
+    # ════════════════════════════════════════════════════════════════
+    total_invested = india_invested_sgd + us_invested_sgd + uk_invested_sgd
+    total_current  = india_current_sgd  + us_current_sgd  + uk_current_sgd
     total_pnl      = total_current - total_invested
     total_pnl_pct  = (total_pnl / total_invested * 100) if total_invested else 0
+    total_daily    = india_daily_sgd + us_daily_sgd + uk_daily_sgd
+    total_daily_pct = (total_daily / (total_current - total_daily) * 100) if (total_current - total_daily) else 0
 
-    # ── Top-level metrics ──────────────────────────────────────────────────────
-    d1, d2, d3, d4 = st.columns(4)
-    d1.metric("Total Invested",  fmt_inr(total_invested))
-    d2.metric("Current Value",   fmt_inr(total_current))
-    d3.metric("Total P&L",       fmt_inr(total_pnl),
+    # ════════════════════════════════════════════════════════════════
+    #  TOP METRICS
+    # ════════════════════════════════════════════════════════════════
+    t1, t2, t3, t4 = st.columns(4)
+    t1.metric("Total Invested",   fmt_sgd_plain(total_invested))
+    t2.metric("Current Value",    fmt_sgd_plain(total_current))
+    t3.metric("Total P&L",        fmt_sgd(total_pnl),
               f"{total_pnl_pct:+.2f}%",
               delta_color="normal" if total_pnl >= 0 else "inverse")
-    d4.metric("Markets",         "India / US / UK")
+    t4.metric("Today's Change",   fmt_sgd(total_daily),
+              f"{total_daily_pct:+.2f}%",
+              delta_color="normal" if total_daily >= 0 else "inverse")
 
     st.markdown("---")
 
-    # ── Per-market breakdown ───────────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════
+    #  PER-MARKET CARDS
+    # ════════════════════════════════════════════════════════════════
     st.markdown("### Breakdown by Market")
     mc1, mc2, mc3 = st.columns(3)
 
-    india_pnl = india_current - india_invested
     with mc1:
-        st.markdown("#### India (Angel One)")
-        st.metric("Funds Added",   fmt_inr(india_invested),
-                  help="Net funds transferred from bank (Angel One + IPO)")
-        st.metric("Current Value", fmt_inr(india_current),
-                  help="Live portfolio value from Angel One holdings")
-        st.metric("P&L",           fmt_inr(india_pnl),
+        st.markdown("#### 🇮🇳 India (Angel One)")
+        india_pnl = india_current_sgd - india_invested_sgd
+        st.metric("Funds Added",    fmt_sgd_plain(india_invested_sgd))
+        st.metric("Current Value",  fmt_sgd_plain(india_current_sgd))
+        st.metric("P&L",            fmt_sgd(india_pnl),
                   delta_color="normal" if india_pnl >= 0 else "inverse")
-        if india_invested == 0:
-            st.caption("Go to Funds Added tab & upload bank statement")
-        if india_current == 0:
-            st.caption("Go to India tab & Connect to load live prices")
+        st.metric("Today's Change", fmt_sgd(india_daily_sgd),
+                  f"{india_daily_pct:+.2f}%",
+                  delta_color="normal" if india_daily_sgd >= 0 else "inverse")
+        if india_status == "needs_connect":
+            st.caption("Go to India tab & click Connect to load live prices")
 
-    us_pnl = us_current_inr - us_invested_inr
     with mc2:
-        st.markdown("#### US (Vested)")
-        st.metric("Total Deposited", fmt_inr(us_invested_inr),
-                  help=f"${us_invested_usd:,.2f} deposited into Vested account")
-        st.metric("Current Value",   fmt_inr(us_current_inr),
-                  help=f"${us_current_usd:,.2f} live market value")
-        st.metric("P&L",             fmt_inr(us_pnl),
+        st.markdown("#### 🇺🇸 US (Vested)")
+        us_pnl = us_current_sgd - us_invested_sgd
+        st.metric("Total Deposited", fmt_sgd_plain(us_invested_sgd))
+        st.metric("Current Value",   fmt_sgd_plain(us_current_sgd))
+        st.metric("P&L",             fmt_sgd(us_pnl),
                   delta_color="normal" if us_pnl >= 0 else "inverse")
-        if us_invested_inr == 0:
+        st.metric("Today's Change",  fmt_sgd(us_daily_sgd),
+                  f"{us_daily_pct:+.2f}%",
+                  delta_color="normal" if us_daily_sgd >= 0 else "inverse")
+        if us_current_sgd == 0:
             st.caption("Go to US tab & upload Holdings file once")
 
-    uk_pnl = uk_current_inr - uk_invested_inr
     with mc3:
-        st.markdown("#### UK (JP Morgan)")
-        st.metric("Invested",      fmt_inr(uk_invested_inr))
-        st.metric("Current Value", fmt_inr(uk_current_inr))
-        st.metric("P&L",           fmt_inr(uk_pnl),
+        st.markdown("#### 🇬🇧 UK (JP Morgan)")
+        uk_pnl = uk_current_sgd - uk_invested_sgd
+        st.metric("Invested",        fmt_sgd_plain(uk_invested_sgd))
+        st.metric("Current Value",   fmt_sgd_plain(uk_current_sgd))
+        st.metric("P&L",             fmt_sgd(uk_pnl),
                   delta_color="normal" if uk_pnl >= 0 else "inverse")
-        if uk_invested_inr == 0:
+        st.metric("Today's Change", fmt_sgd(uk_daily_sgd),
+                  f"{uk_daily_pct:+.2f}%",
+                  delta_color="normal" if uk_daily_sgd >= 0 else "inverse")
+        if uk_current_sgd == 0:
             st.caption("Go to UK tab & add holdings")
 
+    # ════════════════════════════════════════════════════════════════
+    #  FX RATES FOOTER
+    # ════════════════════════════════════════════════════════════════
     st.markdown("---")
-
-    # ── Allocation pie chart ───────────────────────────────────────────────────
-    if total_current > 0:
-        st.markdown("### Portfolio Allocation")
-        alloc_data = {
-            "Market": ["India", "US", "UK"],
-            "Value":  [max(india_current, 0), max(us_current_inr, 0), max(uk_current_inr, 0)],
-        }
-        alloc_df = pd.DataFrame(alloc_data)
-        alloc_df = alloc_df[alloc_df["Value"] > 0]
-        if not alloc_df.empty:
-            fig_pie = px.pie(
-                alloc_df, names="Market", values="Value",
-                color_discrete_sequence=["#FB923C", "#60A5FA", "#A78BFA"],
-                hole=0.45,
-            )
-            fig_pie.update_traces(textposition="outside", textinfo="label+percent",
-                                  textfont=dict(size=13))
-            fig_pie.update_layout(
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                font=dict(color="#C8D0F0"),
-                showlegend=True,
-                legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(size=12)),
-                margin=dict(l=20, r=20, t=20, b=20),
-                height=360,
-            )
-            pc, _ = st.columns([2, 1])
-            with pc:
-                st.plotly_chart(fig_pie, use_container_width=True)
-
-    st.markdown("---")
-    fx1, fx2, fx3 = st.columns(3)
-    fx1.metric("USD / INR", f"{usd_inr:.2f}")
-    fx2.metric("GBP / INR", f"{gbp_inr:.2f}")
-    fx3.metric("Last Updated", datetime.now().strftime("%H:%M:%S"))
+    fx1, fx2, fx3, fx4 = st.columns(4)
+    fx1.metric("USD / SGD", f"S${usd_sgd:.4f}")
+    fx2.metric("GBP / SGD", f"S${gbp_sgd:.4f}")
+    fx3.metric("INR / SGD", f"S${inr_sgd:.5f}")
+    fx4.metric("Last Updated", datetime.now().strftime("%H:%M:%S"))

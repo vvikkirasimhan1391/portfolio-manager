@@ -19,22 +19,35 @@ from typing import Dict, Optional, List
 
 def get_fx_rates() -> Dict[str, float]:
     """
-    Return a dict with current FX rates relative to INR.
+    Return FX rates.
 
-    Keys: "USD", "GBP", "INR"
-    Falls back to sensible defaults on failure.
+    Keys (all expressed as "how many of this currency = 1 USD"):
+      USD_SGD  — SGD per USD
+      GBP_SGD  — SGD per GBP
+      INR_SGD  — SGD per INR
+      USD      — INR per USD  (legacy, kept for India pages)
+      GBP      — INR per GBP  (legacy, kept for UK page)
+      INR      — 1.0
     """
-    rates = {"INR": 1.0, "USD": 84.0, "GBP": 107.0}
-    pairs = {"USD": "USDINR=X", "GBP": "GBPINR=X"}
-
-    for currency, ticker in pairs.items():
+    rates = {
+        "INR": 1.0,
+        "USD": 84.0,   "GBP": 107.0,   # INR-based (legacy)
+        "USD_SGD": 1.35, "GBP_SGD": 1.71, "INR_SGD": 0.016,  # SGD-based
+    }
+    pairs = {
+        "USD":     "USDINR=X",
+        "GBP":     "GBPINR=X",
+        "USD_SGD": "USDSGD=X",
+        "GBP_SGD": "GBPSGD=X",
+        "INR_SGD": "INRSGD=X",
+    }
+    for key, ticker in pairs.items():
         try:
             hist = yf.Ticker(ticker).history(period="2d", interval="1d")
             if not hist.empty:
-                rates[currency] = float(hist["Close"].iloc[-1])
+                rates[key] = float(hist["Close"].iloc[-1])
         except Exception:
-            pass  # keep default
-
+            pass
     return rates
 
 
