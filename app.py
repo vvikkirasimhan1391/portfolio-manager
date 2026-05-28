@@ -1601,25 +1601,64 @@ elif nav == "🇺🇸 US (Vested)":
         st.stop()
 
     summary, holdings = parse_vested_holdings(str(VESTED_HOLDINGS_FILE))
-    # Store in session state for Dashboard to use
-    st.session_state.us_vested_summary = summary
 
-    fx = st.session_state.get("fx_rates", {"USD": 84.0})
+    # ── Fetch live FX rates ────────────────────────────────────────────────────
+    with st.spinner("Fetching live prices…"):
+        try:
+            from utils.price_fetcher import get_fx_rates, get_prices_bulk
+            fx = get_fx_rates()
+            st.session_state.fx_rates = fx
+        except Exception:
+            fx = {"USD": 84.0}
     usd_inr = fx.get("USD", 84.0)
+
+    # ── Fetch live prices for each ticker ──────────────────────────────────────
+    if not holdings.empty and "Ticker" in holdings.columns:
+        tickers = holdings["Ticker"].dropna().tolist()
+        with st.spinner("Fetching live US stock prices…"):
+            try:
+                live_prices = get_prices_bulk(tickers)
+            except Exception:
+                live_prices = {}
+
+        # Overwrite price columns with live data
+        def live_price(ticker):
+            return live_prices.get(ticker, {}).get("price") or None
+
+        holdings["Live Price (USD)"]  = holdings["Ticker"].map(live_price)
+        holdings["Live Value (USD)"]  = holdings["Total Shares Held"] * holdings["Live Price (USD)"]
+        holdings["Live Returns (USD)"] = holdings["Live Value (USD)"] - holdings["Total Amount Invested (USD)"]
+        holdings["Live Returns (%)"]  = (holdings["Live Returns (USD)"] / holdings["Total Amount Invested (USD)"] * 100).round(2)
+        holdings["Daily Change (%)"]  = holdings["Ticker"].map(
+            lambda t: live_prices.get(t, {}).get("daily_change_pct") or None)
+    else:
+        live_prices = {}
+
+    # ── Recalculate summary from live prices ───────────────────────────────────
+    live_total_value    = holdings["Live Value (USD)"].sum()    if "Live Value (USD)"   in holdings.columns else 0
+    live_total_invested = holdings["Total Amount Invested (USD)"].sum() if "Total Amount Invested (USD)" in holdings.columns else 0
+    live_total_returns  = live_total_value - live_total_invested
+    live_returns_pct    = (live_total_returns / live_total_invested * 100) if live_total_invested else 0
+
+    # Update session state with live values for Dashboard
+    st.session_state.us_vested_summary = {
+        "current_value":  live_total_value,
+        "total_invested": live_total_invested,
+        "returns_usd":    live_total_returns,
+        "returns_pct":    f"{live_returns_pct:+.2f}%",
+    }
 
     # ── Summary cards ──────────────────────────────────────────────────────────
     st.markdown("---")
-    cv  = summary.get("current_value", 0)
-    inv = summary.get("total_invested", 0)
-    ret = summary.get("returns_usd", 0)
-    rp  = summary.get("returns_pct", "")
-
     vc1, vc2, vc3, vc4 = st.columns(4)
-    vc1.metric("💵 Current Value",     f"${cv:,.2f}",  f"≈ {fmt_inr(cv * usd_inr)}")
-    vc2.metric("📥 Total Invested",    f"${inv:,.2f}", f"≈ {fmt_inr(inv * usd_inr)}")
-    vc3.metric("📈 Returns (USD)",     f"${ret:+,.2f}", rp,
-               delta_color="normal" if ret >= 0 else "inverse")
-    vc4.metric("🔢 Holdings",          str(len(holdings)))
+    vc1.metric("💵 Live Value",      f"${live_total_value:,.2f}",
+               f"≈ {fmt_inr(live_total_value * usd_inr)}")
+    vc2.metric("📥 Cost Basis",      f"${live_total_invested:,.2f}",
+               f"≈ {fmt_inr(live_total_invested * usd_inr)}")
+    vc3.metric("📈 Returns (USD)",   f"${live_total_returns:+,.2f}",
+               f"{live_returns_pct:+.2f}%",
+               delta_color="normal" if live_total_returns >= 0 else "inverse")
+    vc4.metric("🔢 Holdings",        str(len(holdings)))
 
     st.markdown("---")
 
@@ -1627,45 +1666,44 @@ elif nav == "🇺🇸 US (Vested)":
         st.warning("No holdings data found in the file.")
         st.stop()
 
-    # ── Holdings table ─────────────────────────────────────────────────────────
-    st.markdown("### Holdings")
+    # ── Holdings table with live prices ───────────────────────────────────────
+    st.markdown("### Holdings (Live Prices)")
     disp = pd.DataFrame()
-    disp["Company"]          = holdings.get("Name", holdings.get("Ticker", "—"))
-    disp["Ticker"]           = holdings.get("Ticker", "—")
-    disp["Shares"]           = holdings["Total Shares Held"].map(lambda x: f"{x:.4f}" if pd.notna(x) else "—")
-    disp["Avg Cost"]         = holdings["Average Cost (USD)"].map(lambda x: f"${x:,.2f}" if pd.notna(x) else "—")
-    disp["Current Price"]    = holdings["Current Price (USD)"].map(lambda x: f"${x:,.2f}" if pd.notna(x) else "—")
-    disp["Invested (USD)"]   = holdings["Total Amount Invested (USD)"].map(lambda x: f"${x:,.2f}" if pd.notna(x) else "—")
-    disp["Value (USD)"]      = holdings["Current Value (USD)"].map(lambda x: f"${x:,.2f}" if pd.notna(x) else "—")
-    disp["Value (INR)"]      = holdings["Current Value (USD)"].map(lambda x: fmt_inr(x * usd_inr) if pd.notna(x) else "—")
-    disp["Returns (USD)"]    = holdings["Investment Returns (USD)"].map(
+    disp["Company"]        = holdings.get("Name", holdings.get("Ticker", "—"))
+    disp["Ticker"]         = holdings["Ticker"]
+    disp["Shares"]         = holdings["Total Shares Held"].map(lambda x: f"{x:.4f}" if pd.notna(x) else "—")
+    disp["Avg Cost"]       = holdings["Average Cost (USD)"].map(lambda x: f"${x:,.2f}" if pd.notna(x) else "—")
+    disp["Live Price"]     = holdings["Live Price (USD)"].map(lambda x: f"${x:,.2f}" if pd.notna(x) else "—")
+    disp["Invested"]       = holdings["Total Amount Invested (USD)"].map(lambda x: f"${x:,.2f}" if pd.notna(x) else "—")
+    disp["Live Value"]     = holdings["Live Value (USD)"].map(lambda x: f"${x:,.2f}" if pd.notna(x) else "—")
+    disp["Value (INR)"]    = holdings["Live Value (USD)"].map(lambda x: fmt_inr(x * usd_inr) if pd.notna(x) else "—")
+    disp["Returns"]        = holdings["Live Returns (USD)"].map(
         lambda x: (f"+${x:,.2f}" if x >= 0 else f"-${abs(x):,.2f}") if pd.notna(x) else "—")
-    disp["Returns (%)"]      = holdings["Investment Returns (%)"].map(
+    disp["Returns %"]      = holdings["Live Returns (%)"].map(
         lambda x: f"{x:+.2f}%" if pd.notna(x) else "—")
-    disp["Day Change"]       = holdings["Daily Change (USD)"].map(
-        lambda x: (f"+${x:,.2f}" if x >= 0 else f"-${abs(x):,.2f}") if pd.notna(x) else "—")
+    disp["Day Change %"]   = holdings["Daily Change (%)"].map(
+        lambda x: f"{x:+.2f}%" if pd.notna(x) else "—")
 
     st.dataframe(disp, use_container_width=True, hide_index=True)
 
-    # ── P&L bar chart ──────────────────────────────────────────────────────────
-    st.markdown("### Returns by Stock")
-    pnl_col = "Investment Returns (USD)"
-    if pnl_col in holdings.columns:
-        chart = holdings[["Ticker", pnl_col, "Name"]].dropna().sort_values(pnl_col)
+    # ── P&L bar chart (live) ───────────────────────────────────────────────────
+    st.markdown("### Live Returns by Stock")
+    if "Live Returns (USD)" in holdings.columns:
+        chart = holdings[["Ticker", "Live Returns (USD)", "Name"]].dropna().sort_values("Live Returns (USD)")
         fig = px.bar(
-            chart, x=pnl_col, y="Ticker", orientation="h",
-            color=pnl_col,
-            color_continuous_scale=["#E2445C", "#F97316", "#22C55E"],
-            labels={pnl_col: "Returns (USD)", "Ticker": ""},
+            chart, x="Live Returns (USD)", y="Ticker", orientation="h",
+            color="Live Returns (USD)",
+            color_continuous_scale=["#EF4444", "#F97316", "#22C55E"],
+            labels={"Live Returns (USD)": "Returns (USD)", "Ticker": ""},
             hover_data=["Name"],
         )
         fig.add_vline(x=0, line_color="#6b7280", line_dash="dash")
         fig.update_layout(
-            paper_bgcolor="#1E2130", plot_bgcolor="#1E2130",
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
             font=dict(color="#C0C4D0"),
             coloraxis_showscale=False,
             margin=dict(l=0, r=20, t=10, b=0),
-            height=max(280, len(chart) * 38),
+            height=max(280, len(chart) * 42),
             xaxis=dict(showgrid=False, zeroline=False),
             yaxis=dict(showgrid=False),
         )
