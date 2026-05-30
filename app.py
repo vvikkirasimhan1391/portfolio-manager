@@ -34,6 +34,7 @@ UPLOADS_DIR               = DATA_DIR / "uploads"
 UPLOADS_DIR.mkdir(exist_ok=True)
 VESTED_HOLDINGS_FILE      = UPLOADS_DIR / "vested_holdings.xlsx"
 VESTED_TRANSACTIONS_FILE  = UPLOADS_DIR / "vested_transactions.xlsx"
+LOANS_FILE                = UPLOADS_DIR / "loans.xlsx"
 
 # ── Helpers ─────────────────────────────────────────────────────────────────────
 def load_json(path, default):
@@ -290,7 +291,7 @@ with st.sidebar:
 
     nav = st.radio(
         "Navigate",
-        ["🏠 Dashboard", "🏦 Funds Added", "🇮🇳 India (Angel One)", "🇺🇸 US (Vested)", "🇬🇧 UK (JP Morgan)", "📋 Trade Analytics", "⚙️ Settings"],
+        ["🏠 Dashboard", "🏦 Funds Added", "🇮🇳 India (Angel One)", "🇺🇸 US (Vested)", "🇬🇧 UK (JP Morgan)", "📋 Trade Analytics", "💳 Loans", "⚙️ Settings"],
         label_visibility="collapsed",
     )
 
@@ -1313,6 +1314,221 @@ elif nav == "📋 Trade Analytics":
             st.success(f"**Total Deposited: ${total_deposited:,.2f}** "
                        f"(≈ {fmt_inr(total_deposited * usd_to_inr)})")
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PAGE: LOANS
+# ══════════════════════════════════════════════════════════════════════════════
+elif nav == "💳 Loans":
+    st.title("💳 Loan Dashboard")
+
+    # ── Helper to load & clean loans ────────────────────────────────────────
+    def load_loans(file_path):
+        try:
+            xl  = pd.ExcelFile(str(file_path))
+            df  = xl.parse(xl.sheet_names[0])
+            df.columns = [c.strip() for c in df.columns]
+            # Rename to standard names regardless of original casing
+            col_map = {}
+            for c in df.columns:
+                cl = c.lower()
+                if "bank" in cl or "name" in cl or "loan" in cl:
+                    col_map[c] = "Bank"
+                elif "amount" in cl or "outstanding" in cl or "principal" in cl:
+                    col_map[c] = "Amount"
+                elif "emi" in cl or "monthly" in cl or "instalment" in cl:
+                    col_map[c] = "EMI"
+            df = df.rename(columns=col_map)
+            # Fix malformed numbers like '2.377.63'
+            def clean_num(v):
+                if isinstance(v, str):
+                    parts = v.split(".")
+                    if len(parts) > 2:
+                        return float("".join(parts[:-1]) + "." + parts[-1])
+                    return float(v.replace(",", ""))
+                return float(v)
+            df["Amount"] = df["Amount"].apply(clean_num)
+            df["EMI"]    = df["EMI"].apply(clean_num)
+            return df, None
+        except Exception as e:
+            return None, str(e)
+
+    # ── Upload or use saved file ─────────────────────────────────────────────
+    uploaded = st.file_uploader("Update loans file (optional)", type=["xlsx","xls"])
+    if uploaded:
+        with open(str(LOANS_FILE), "wb") as f:
+            f.write(uploaded.read())
+        st.success("Loans file updated.")
+
+    if not LOANS_FILE.exists():
+        st.warning("No loans file found. Please upload your loans.xlsx above.")
+        st.stop()
+
+    df_loans, err = load_loans(LOANS_FILE)
+    if err or df_loans is None:
+        st.error(f"Could not load loans file: {err}")
+        st.stop()
+
+    # ── Derived columns ──────────────────────────────────────────────────────
+    df_loans["Annual EMI"]     = df_loans["EMI"] * 12
+    df_loans["Est. Months"]    = (df_loans["Amount"] / df_loans["EMI"]).round(1)
+    df_loans["% of Total Debt"]= (df_loans["Amount"] / df_loans["Amount"].sum() * 100).round(1)
+
+    # Category from bank name
+    def categorise(name):
+        n = str(name).upper()
+        if "CREDIT LINE" in n:  return "Credit Line"
+        if "QUICK CASH"  in n:  return "Quick Cash"
+        return "Term Loan"
+    df_loans["Category"] = df_loans["Bank"].apply(categorise)
+
+    total_debt   = df_loans["Amount"].sum()
+    total_emi    = df_loans["EMI"].sum()
+    annual_emi   = total_emi * 12
+    num_loans    = len(df_loans)
+    avg_months   = (df_loans["Amount"] / df_loans["EMI"]).mean()
+
+    # ── HERO METRICS ─────────────────────────────────────────────────────────
+    def loan_metric(label, value_str, sub="", color="#E8EEFF"):
+        st.markdown(f"""
+        <div style="background:linear-gradient(135deg,#151929,#1C2138);
+                    border:1px solid #252A45;border-radius:14px;
+                    padding:14px 16px;box-shadow:0 4px 16px rgba(0,0,0,0.35);">
+            <div style="font-size:0.72rem;color:#6B748F;text-transform:uppercase;
+                        letter-spacing:0.06em;margin-bottom:6px">{label}</div>
+            <div style="font-size:1.25rem;font-weight:700;color:{color}">{value_str}</div>
+            <div style="font-size:0.78rem;color:#9BA3C0;margin-top:2px">{sub}</div>
+        </div>""", unsafe_allow_html=True)
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1: loan_metric("Total Outstanding", f"S${total_debt:,.0f}", f"{num_loans} active loans", "#EF4444")
+    with c2: loan_metric("Monthly EMI", f"S${total_emi:,.2f}", "total commitment/month", "#F59E0B")
+    with c3: loan_metric("Annual Burden", f"S${annual_emi:,.0f}", "total EMI per year", "#F59E0B")
+    with c4: loan_metric("Avg. Payoff", f"{avg_months:.0f} months", f"~{avg_months/12:.1f} years at current EMI", "#60A5FA")
+
+    st.markdown("---")
+
+    # ── ROW 2: Category summary ───────────────────────────────────────────────
+    st.markdown("### By Category")
+    cat_df = df_loans.groupby("Category").agg(
+        Loans    = ("Bank",   "count"),
+        Amount   = ("Amount", "sum"),
+        EMI      = ("EMI",    "sum"),
+    ).reset_index()
+
+    colors_map = {"Credit Line": "#60A5FA", "Quick Cash": "#F59E0B", "Term Loan": "#A78BFA"}
+    cols = st.columns(len(cat_df))
+    for i, row in cat_df.iterrows():
+        clr = colors_map.get(row["Category"], "#E8EEFF")
+        with cols[i]:
+            loan_metric(
+                row["Category"],
+                f"S${row['Amount']:,.0f}",
+                f"{row['Loans']} loans · S${row['EMI']:,.2f}/mo",
+                clr
+            )
+
+    st.markdown("---")
+
+    # ── ROW 3: Charts ────────────────────────────────────────────────────────
+    col_left, col_right = st.columns(2)
+
+    with col_left:
+        st.markdown("#### Loan Composition")
+        fig_pie = go.Figure(go.Pie(
+            labels   = df_loans["Bank"],
+            values   = df_loans["Amount"],
+            hole     = 0.55,
+            textinfo = "percent",
+            hovertemplate = "<b>%{label}</b><br>S$%{value:,.0f}<br>%{percent}<extra></extra>",
+            marker   = dict(colors=px.colors.qualitative.Bold),
+        ))
+        fig_pie.add_annotation(
+            text=f"S${total_debt/1000:.0f}K<br><span style='font-size:11px'>Total</span>",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(size=16, color="#E8EEFF"),
+        )
+        fig_pie.update_layout(
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            font_color="#9BA3C0", showlegend=True,
+            legend=dict(font=dict(size=10), bgcolor="rgba(0,0,0,0)"),
+            margin=dict(t=10, b=10, l=10, r=10), height=320,
+        )
+        st.plotly_chart(fig_pie, use_container_width=True)
+
+    with col_right:
+        st.markdown("#### Monthly EMI per Loan")
+        df_sorted = df_loans.sort_values("EMI", ascending=True)
+        fig_bar = go.Figure(go.Bar(
+            x            = df_sorted["EMI"],
+            y            = df_sorted["Bank"],
+            orientation  = "h",
+            marker_color = [colors_map.get(c, "#60A5FA") for c in df_sorted["Category"]],
+            text         = [f"S${v:,.0f}" for v in df_sorted["EMI"]],
+            textposition = "outside",
+            hovertemplate= "<b>%{y}</b><br>EMI: S$%{x:,.2f}<extra></extra>",
+        ))
+        fig_bar.update_layout(
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            font_color="#9BA3C0", xaxis=dict(showgrid=False, color="#6B748F"),
+            yaxis=dict(showgrid=False, color="#9BA3C0"),
+            margin=dict(t=10, b=10, l=10, r=60), height=320,
+        )
+        st.plotly_chart(fig_bar, use_container_width=True)
+
+    # ── ROW 4: Payoff timeline ────────────────────────────────────────────────
+    st.markdown("#### Estimated Payoff Timeline")
+    df_tl = df_loans[["Bank","Amount","EMI","Est. Months","Category"]].copy()
+    df_tl = df_tl.sort_values("Est. Months", ascending=False)
+
+    fig_tl = go.Figure()
+    for _, row in df_tl.iterrows():
+        clr = colors_map.get(row["Category"], "#60A5FA")
+        fig_tl.add_trace(go.Bar(
+            name         = row["Bank"],
+            x            = [row["Est. Months"]],
+            y            = [row["Bank"]],
+            orientation  = "h",
+            marker_color = clr,
+            text         = [f"{row['Est. Months']:.0f} mo  (S${row['Amount']:,.0f})"],
+            textposition = "outside",
+            hovertemplate= f"<b>{row['Bank']}</b><br>~{row['Est. Months']:.0f} months<br>Outstanding: S${row['Amount']:,.0f}<extra></extra>",
+        ))
+    fig_tl.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font_color="#9BA3C0", showlegend=False,
+        xaxis=dict(title="Estimated Months Remaining", color="#6B748F", showgrid=False),
+        yaxis=dict(showgrid=False, color="#9BA3C0"),
+        margin=dict(t=10, b=40, l=10, r=120), height=320,
+    )
+    st.plotly_chart(fig_tl, use_container_width=True)
+
+    # ── ROW 5: Full table ─────────────────────────────────────────────────────
+    st.markdown("#### Loan Details")
+    display_df = df_loans[["Bank","Category","Amount","EMI","Annual EMI","Est. Months","% of Total Debt"]].copy()
+    display_df = display_df.rename(columns={"Est. Months":"Est. Months Left"})
+
+    # Format for display
+    fmt_df = display_df.copy()
+    fmt_df["Amount"]        = fmt_df["Amount"].apply(lambda v: f"S${v:,.2f}")
+    fmt_df["EMI"]           = fmt_df["EMI"].apply(lambda v: f"S${v:,.2f}")
+    fmt_df["Annual EMI"]    = fmt_df["Annual EMI"].apply(lambda v: f"S${v:,.2f}")
+    fmt_df["% of Total Debt"] = fmt_df["% of Total Debt"].apply(lambda v: f"{v:.1f}%")
+
+    # Totals row
+    totals = {
+        "Bank": "TOTAL", "Category": "",
+        "Amount": f"S${total_debt:,.2f}",
+        "EMI": f"S${total_emi:,.2f}",
+        "Annual EMI": f"S${annual_emi:,.2f}",
+        "Est. Months Left": "—",
+        "% of Total Debt": "100%"
+    }
+    fmt_df = pd.concat([fmt_df, pd.DataFrame([totals])], ignore_index=True)
+
+    st.dataframe(fmt_df, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    st.caption(f"Data last loaded from loans.xlsx · {num_loans} loans · Total EMI S${total_emi:,.2f}/month")
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  PAGE: SETTINGS
