@@ -1325,29 +1325,58 @@ elif nav == "💳 Loans":
     def load_loans(file_path):
         try:
             xl  = pd.ExcelFile(str(file_path))
-            df  = xl.parse(xl.sheet_names[0])
+            # Try header=0 first; if columns look numeric try header=None
+            df  = xl.parse(xl.sheet_names[0], header=0)
             df.columns = [str(c).strip() for c in df.columns]
+
+            # If pandas missed the header (columns are integers), re-read with no header
+            if all(str(c).isdigit() for c in df.columns):
+                df = xl.parse(xl.sheet_names[0], header=None)
+                df.columns = [str(c).strip() for c in df.iloc[0]]
+                df = df.iloc[1:].reset_index(drop=True)
+
             # Rename to standard names regardless of original casing
             col_map = {}
             for c in df.columns:
-                cl = c.lower()
-                if "bank" in cl or "name" in cl or "loan" in cl:
+                cl = str(c).lower()
+                if "bank" in cl or "name" in cl:
                     col_map[c] = "Bank"
                 elif "amount" in cl or "outstanding" in cl or "principal" in cl:
                     col_map[c] = "Amount"
                 elif "emi" in cl or "monthly" in cl or "instalment" in cl:
                     col_map[c] = "EMI"
             df = df.rename(columns=col_map)
-            # Fix malformed numbers like '2.377.63'
+
+            # Keep only rows that have Bank, Amount, EMI
+            for col in ["Bank", "Amount", "EMI"]:
+                if col not in df.columns:
+                    return None, f"Column '{col}' not found. Columns found: {list(df.columns)}"
+
+            # Fix malformed numbers like '2.377.63'; return None for non-numeric strings
             def clean_num(v):
-                if isinstance(v, str):
-                    parts = v.split(".")
-                    if len(parts) > 2:
-                        return float("".join(parts[:-1]) + "." + parts[-1])
-                    return float(v.replace(",", ""))
-                return float(v)
+                if v is None or (isinstance(v, float) and pd.isna(v)):
+                    return None
+                if isinstance(v, (int, float)):
+                    return float(v)
+                s = str(v).strip().replace(",", "")
+                if not s or s.lower() in ("amount", "emi", "nan", "-", "n/a"):
+                    return None
+                parts = s.split(".")
+                if len(parts) > 2:          # e.g. '2.377.63'
+                    s = "".join(parts[:-1]) + "." + parts[-1]
+                try:
+                    return float(s)
+                except ValueError:
+                    return None
+
             df["Amount"] = df["Amount"].apply(clean_num)
             df["EMI"]    = df["EMI"].apply(clean_num)
+
+            # Drop header-repeat rows or blank rows
+            df = df.dropna(subset=["Amount", "EMI"])
+            df = df[df["Amount"] > 0]
+            df = df.reset_index(drop=True)
+
             return df, None
         except Exception as e:
             return None, str(e)
@@ -2107,21 +2136,25 @@ elif nav == "🇬🇧 UK (JP Morgan)":
 elif nav == "🏠 Dashboard":
     st.title("🏠 Portfolio Dashboard")
 
+
     # ── Custom colored metric card ─────────────────────────────────────────────
     def dash_metric(label, value_str, delta_str="", positive=None):
         """Render a metric card: green if positive=True, red if False, white if None."""
         val_color  = "#22C55E" if positive is True else "#EF4444" if positive is False else "#E8EEFF"
         delt_color = "#22C55E" if positive is True else "#EF4444" if positive is False else "#9BA3C0"
-        delta_html = f'<div style="font-size:0.78rem;color:{delt_color};margin-top:2px">{delta_str}</div>' if delta_str else ""
-        st.markdown(f"""
-        <div style="background:linear-gradient(135deg,#151929,#1C2138);
-                    border:1px solid #252A45;border-radius:14px;
-                    padding:14px 16px;box-shadow:0 4px 16px rgba(0,0,0,0.35);">
-            <div style="font-size:0.72rem;color:#6B748F;text-transform:uppercase;
-                        letter-spacing:0.06em;margin-bottom:6px">{label}</div>
-            <div style="font-size:1.25rem;font-weight:700;color:{val_color}">{value_str}</div>
-            {delta_html}
-        </div>""", unsafe_allow_html=True)
+        delta_html = (f'<div style="font-size:0.78rem;color:{delt_color};margin-top:2px">{delta_str}</div>'
+                      if delta_str else "")
+        st.markdown(
+            f'''<div style="background:linear-gradient(135deg,#151929,#1C2138);
+                     border:1px solid #252A45;border-radius:14px;
+                     padding:14px 16px;box-shadow:0 4px 16px rgba(0,0,0,0.35);">
+                <div style="font-size:0.72rem;color:#6B748F;text-transform:uppercase;
+                            letter-spacing:0.06em;margin-bottom:6px">{label}</div>
+                <div style="font-size:1.25rem;font-weight:700;color:{val_color}">{value_str}</div>
+                {delta_html}
+            </div>''',
+            unsafe_allow_html=True,
+        )
 
     # ── Fetch FX + live prices ─────────────────────────────────────────────────
     with st.spinner("Fetching live rates…"):
@@ -2149,12 +2182,12 @@ elif nav == "🏠 Dashboard":
     # ════════════════════════════════════════════════════════════════
     #  INDIA — auto-fetch if credentials set, session state not loaded
     # ════════════════════════════════════════════════════════════════
-    india_invested_sgd = 0.0
-    india_current_sgd  = 0.0
-    india_daily_sgd    = 0.0
-    india_daily_pct    = 0.0
-    india_current_inr  = 0.0
-    india_daily_inr_val= 0.0
+    india_invested_sgd  = 0.0
+    india_current_sgd   = 0.0
+    india_daily_sgd     = 0.0
+    india_daily_pct     = 0.0
+    india_current_inr   = 0.0
+    india_daily_inr_val = 0.0
 
     india_funds_data   = load_json(str(INDIA_FUNDS_FILE), {})
     india_invested_inr = float(india_funds_data.get("net_added", 0))
@@ -2162,7 +2195,6 @@ elif nav == "🏠 Dashboard":
 
     df_india = st.session_state.get("angel_holdings")
 
-    # Auto-connect if creds available and holdings not loaded yet
     if df_india is None:
         has_creds = all([settings.get("angel_api_key"), settings.get("angel_client_id"),
                          settings.get("angel_password"), settings.get("angel_totp_secret")])
@@ -2180,7 +2212,7 @@ elif nav == "🏠 Dashboard":
                     if _err:
                         st.warning(f"India: {_err}")
                     else:
-                        for col in ["quantity","averageprice","ltp","close"]:
+                        for col in ["quantity", "averageprice", "ltp", "close"]:
                             if col in _df.columns:
                                 _df[col] = pd.to_numeric(_df[col], errors="coerce").fillna(0)
                         if "investedvalue" not in _df.columns:
@@ -2195,10 +2227,12 @@ elif nav == "🏠 Dashboard":
 
     if df_india is not None and not df_india.empty:
         if "totvalue" in df_india.columns:
-            india_current_inr  = float(df_india["totvalue"].sum())
-            india_current_sgd  = india_current_inr * inr_sgd
-        if all(c in df_india.columns for c in ["ltp","close","quantity"]):
-            india_daily_inr_val = float(((df_india["ltp"] - df_india["close"]) * df_india["quantity"]).sum())
+            india_current_inr = float(df_india["totvalue"].sum())
+            india_current_sgd = india_current_inr * inr_sgd
+        if all(c in df_india.columns for c in ["ltp", "close", "quantity"]):
+            india_daily_inr_val = float(
+                ((df_india["ltp"] - df_india["close"]) * df_india["quantity"]).sum()
+            )
             india_daily_sgd = india_daily_inr_val * inr_sgd
             base = india_current_inr - india_daily_inr_val
             india_daily_pct = (india_daily_inr_val / base * 100) if base else 0
@@ -2231,19 +2265,19 @@ elif nav == "🏠 Dashboard":
             _xl  = pd.ExcelFile(str(VESTED_HOLDINGS_FILE))
             _hdf = _xl.parse("Holdings")
             _hdf.columns = [c.strip() for c in _hdf.columns]
-            for col in ["Total Shares Held","Total Amount Invested (USD)"]:
+            for col in ["Total Shares Held", "Total Amount Invested (USD)"]:
                 if col in _hdf.columns:
                     _hdf[col] = pd.to_numeric(_hdf[col], errors="coerce").fillna(0)
             tickers_us = _hdf["Ticker"].dropna().tolist()
             lp_us = get_prices_bulk(tickers_us) if tickers_us else {}
             for _, row in _hdf.iterrows():
-                t   = row.get("Ticker","")
+                t   = row.get("Ticker", "")
                 qty = float(row.get("Total Shares Held", 0) or 0)
                 pi  = lp_us.get(t, {})
                 pr  = pi.get("price") or 0
                 dcp = pi.get("daily_change_pct") or 0
                 us_current_usd += qty * pr
-                prev = pr / (1 + dcp/100) if (1 + dcp/100) != 0 else pr
+                prev = pr / (1 + dcp / 100) if (1 + dcp / 100) != 0 else pr
                 us_daily_usd   += qty * (pr - prev)
             us_current_sgd = us_current_usd * usd_sgd
             us_daily_sgd   = us_daily_usd   * usd_sgd
@@ -2271,9 +2305,10 @@ elif nav == "🏠 Dashboard":
             avg = float(h.get("avg_price_gbp", 0))
             pi  = lp_uk.get(t, {})
             ltp = pi.get("price") or 0
-            if ltp > 500: ltp = ltp / 100
+            if ltp > 500:
+                ltp = ltp / 100
             dcp = pi.get("daily_change_pct") or 0
-            prev = ltp / (1 + dcp/100) if (1 + dcp/100) != 0 else ltp
+            prev = ltp / (1 + dcp / 100) if (1 + dcp / 100) != 0 else ltp
             uk_invested_gbp += qty * avg
             uk_current_gbp  += qty * ltp
             uk_daily_gbp    += qty * (ltp - prev)
@@ -2286,12 +2321,12 @@ elif nav == "🏠 Dashboard":
     # ════════════════════════════════════════════════════════════════
     #  TOTALS
     # ════════════════════════════════════════════════════════════════
-    total_invested = india_invested_sgd + us_invested_sgd + uk_invested_sgd
-    total_current  = india_current_sgd  + us_current_sgd  + uk_current_sgd
-    total_pnl      = total_current - total_invested
-    total_pnl_pct  = (total_pnl  / total_invested  * 100) if total_invested  else 0
-    total_daily    = india_daily_sgd + us_daily_sgd + uk_daily_sgd
-    base_total     = total_current - total_daily
+    total_invested  = india_invested_sgd + us_invested_sgd + uk_invested_sgd
+    total_current   = india_current_sgd  + us_current_sgd  + uk_current_sgd
+    total_pnl       = total_current - total_invested
+    total_pnl_pct   = (total_pnl / total_invested * 100) if total_invested else 0
+    total_daily     = india_daily_sgd + us_daily_sgd + uk_daily_sgd
+    base_total      = total_current - total_daily
     total_daily_pct = (total_daily / base_total * 100) if base_total else 0
 
     # ════════════════════════════════════════════════════════════════
@@ -2302,7 +2337,7 @@ elif nav == "🏠 Dashboard":
     with t2: dash_metric("Current Value",   fmt_sgd_plain(total_current))
     with t3: dash_metric("Total P&L",       fmt_sgd_signed(total_pnl),
                           f"{total_pnl_pct:+.2f}%", positive=total_pnl >= 0)
-    with t4: dash_metric("Today's Change",  fmt_sgd_signed(total_daily),
+    with t4: dash_metric("Today's Change", fmt_sgd_signed(total_daily),
                           f"{total_daily_pct:+.2f}%", positive=total_daily >= 0)
 
     st.markdown("---")
@@ -2313,33 +2348,34 @@ elif nav == "🏠 Dashboard":
     st.markdown("### Breakdown by Market")
 
     def fmt_inr_plain(v):
-        try: return f"₹{float(v):,.2f}"
-        except: return "—"
+        try: return f"\u20b9{float(v):,.2f}"
+        except: return "\u2014"
     def fmt_inr_signed(v):
         try:
             v = float(v)
-            return f"+₹{v:,.2f}" if v >= 0 else f"-₹{abs(v):,.2f}"
-        except: return "—"
+            return f"+\u20b9{v:,.2f}" if v >= 0 else f"-\u20b9{abs(v):,.2f}"
+        except: return "\u2014"
     def fmt_usd_plain(v):
         try: return f"${float(v):,.2f}"
-        except: return "—"
+        except: return "\u2014"
     def fmt_usd_signed(v):
         try:
             v = float(v)
             return f"+${v:,.2f}" if v >= 0 else f"-${abs(v):,.2f}"
-        except: return "—"
+        except: return "\u2014"
 
     # India — INR
     india_pnl     = india_current_inr - india_invested_inr
     india_pnl_pct = (india_pnl / india_invested_inr * 100) if india_invested_inr else 0
     with st.expander(
-        f"🇮🇳 India (Angel One)  |  {fmt_inr_plain(india_current_inr)}  {('+' if india_pnl>=0 else '')}{india_pnl_pct:.1f}%",
-        expanded=True
+        f"\U0001f1ee\U0001f1f3 India (Angel One)  |  {fmt_inr_plain(india_current_inr)}  "
+        f"{(chr(43) if india_pnl >= 0 else chr(45))}{india_pnl_pct:.1f}%",
+        expanded=True,
     ):
         c1, c2, c3, c4 = st.columns(4)
-        with c1: dash_metric("Funds Added (INR)",  fmt_inr_plain(india_invested_inr))
-        with c2: dash_metric("Current Value (INR)", fmt_inr_plain(india_current_inr))
-        with c3: dash_metric("P&L",                 fmt_inr_signed(india_pnl),
+        with c1: dash_metric("Funds Added (INR)",   fmt_inr_plain(india_invested_inr))
+        with c2: dash_metric("Current Value (INR)",  fmt_inr_plain(india_current_inr))
+        with c3: dash_metric("P&L",                  fmt_inr_signed(india_pnl),
                               f"{india_pnl_pct:+.2f}%", positive=india_pnl >= 0)
         with c4: dash_metric("Today's Change",      fmt_inr_signed(india_daily_inr_val),
                               f"{india_daily_pct:+.2f}%", positive=india_daily_inr_val >= 0)
@@ -2348,13 +2384,14 @@ elif nav == "🏠 Dashboard":
     us_pnl     = us_current_usd - us_invested_usd
     us_pnl_pct = (us_pnl / us_invested_usd * 100) if us_invested_usd else 0
     with st.expander(
-        f"🇺🇸 US (Vested)  |  {fmt_usd_plain(us_current_usd)}  {('+' if us_pnl>=0 else '')}{us_pnl_pct:.1f}%",
-        expanded=True
+        f"\U0001f1fa\U0001f1f8 US (Vested)  |  {fmt_usd_plain(us_current_usd)}  "
+        f"{(chr(43) if us_pnl >= 0 else chr(45))}{us_pnl_pct:.1f}%",
+        expanded=True,
     ):
         c1, c2, c3, c4 = st.columns(4)
-        with c1: dash_metric("Deposited (USD)",    fmt_usd_plain(us_invested_usd))
-        with c2: dash_metric("Current Value (USD)", fmt_usd_plain(us_current_usd))
-        with c3: dash_metric("P&L",                 fmt_usd_signed(us_pnl),
+        with c1: dash_metric("Deposited (USD)",     fmt_usd_plain(us_invested_usd))
+        with c2: dash_metric("Current Value (USD)",  fmt_usd_plain(us_current_usd))
+        with c3: dash_metric("P&L",                  fmt_usd_signed(us_pnl),
                               f"{us_pnl_pct:+.2f}%", positive=us_pnl >= 0)
         with c4: dash_metric("Today's Change",      fmt_usd_signed(us_daily_usd),
                               f"{us_daily_pct:+.2f}%", positive=us_daily_usd >= 0)
@@ -2363,15 +2400,16 @@ elif nav == "🏠 Dashboard":
     uk_pnl     = uk_current_sgd - uk_invested_sgd
     uk_pnl_pct = (uk_pnl / uk_invested_sgd * 100) if uk_invested_sgd else 0
     with st.expander(
-        f"🇬🇧 UK (JP Morgan)  |  {fmt_sgd_plain(uk_current_sgd)}  {('+' if uk_pnl>=0 else '')}{uk_pnl_pct:.1f}%",
-        expanded=True
+        f"\U0001f1ec\U0001f1e7 UK (JP Morgan)  |  {fmt_sgd_plain(uk_current_sgd)}  "
+        f"{(chr(43) if uk_pnl >= 0 else chr(45))}{uk_pnl_pct:.1f}%",
+        expanded=True,
     ):
         c1, c2, c3, c4 = st.columns(4)
         with c1: dash_metric("Invested (SGD)",      fmt_sgd_plain(uk_invested_sgd))
         with c2: dash_metric("Current Value (SGD)", fmt_sgd_plain(uk_current_sgd))
         with c3: dash_metric("P&L",                 fmt_sgd_signed(uk_pnl),
                               f"{uk_pnl_pct:+.2f}%", positive=uk_pnl >= 0)
-        with c4: dash_metric("Today's Change",      fmt_sgd_signed(uk_daily_sgd),
+        with c4: dash_metric("Today's Change",     fmt_sgd_signed(uk_daily_sgd),
                               f"{uk_daily_pct:+.2f}%", positive=uk_daily_sgd >= 0)
 
     # ════════════════════════════════════════════════════════════════
