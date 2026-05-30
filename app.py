@@ -1326,7 +1326,7 @@ elif nav == "💳 Loans":
         try:
             xl  = pd.ExcelFile(str(file_path))
             df  = xl.parse(xl.sheet_names[0])
-            df.columns = [c.strip() for c in df.columns]
+            df.columns = [str(c).strip() for c in df.columns]
             # Rename to standard names regardless of original casing
             col_map = {}
             for c in df.columns:
