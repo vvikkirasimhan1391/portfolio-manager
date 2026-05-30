@@ -2142,19 +2142,22 @@ elif nav == "🏠 Dashboard":
         """Render a metric card: green if positive=True, red if False, white if None."""
         val_color  = "#22C55E" if positive is True else "#EF4444" if positive is False else "#E8EEFF"
         delt_color = "#22C55E" if positive is True else "#EF4444" if positive is False else "#9BA3C0"
-        delta_html = (f'<div style="font-size:0.78rem;color:{delt_color};margin-top:2px">{delta_str}</div>'
-                      if delta_str else "")
-        st.markdown(
-            f'''<div style="background:linear-gradient(135deg,#151929,#1C2138);
-                     border:1px solid #252A45;border-radius:14px;
-                     padding:14px 16px;box-shadow:0 4px 16px rgba(0,0,0,0.35);">
-                <div style="font-size:0.72rem;color:#6B748F;text-transform:uppercase;
-                            letter-spacing:0.06em;margin-bottom:6px">{label}</div>
-                <div style="font-size:1.25rem;font-weight:700;color:{val_color}">{value_str}</div>
-                {delta_html}
-            </div>''',
-            unsafe_allow_html=True,
+        delta_part = (
+            '<p style="font-size:0.78rem;color:' + delt_color + ';margin:2px 0 0 0">' + delta_str + '</p>'
+            if delta_str else ""
         )
+        html = (
+            '<div style="background:linear-gradient(135deg,#151929,#1C2138);'
+            'border:1px solid #252A45;border-radius:14px;'
+            'padding:14px 16px;box-shadow:0 4px 16px rgba(0,0,0,0.35);">'
+            '<p style="font-size:0.72rem;color:#6B748F;text-transform:uppercase;'
+            'letter-spacing:0.06em;margin:0 0 6px 0">' + label + '</p>'
+            '<p style="font-size:1.25rem;font-weight:700;color:' + val_color + ';margin:0">'
+            + value_str + '</p>'
+            + delta_part +
+            '</div>'
+        )
+        st.markdown(html, unsafe_allow_html=True)
 
     # ── Fetch FX + live prices ─────────────────────────────────────────────────
     with st.spinner("Fetching live rates…"):
